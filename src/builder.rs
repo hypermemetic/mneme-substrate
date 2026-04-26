@@ -6,6 +6,9 @@ use std::sync::{Arc, Weak};
 
 use crate::activations::arbor::{Arbor, ArborConfig};
 use crate::activations::bash::Bash;
+use crate::activations::forecast::Forecast;
+use crate::mneme::context::MnemeContext;
+use crate::mneme::runtime::claudecode_swarm_runtime::ClaudeCodeSwarmRuntime;
 #[cfg(feature = "chaos")]
 use crate::activations::chaos::Chaos;
 use crate::activations::claudecode::{ClaudeCode, ClaudeCodeStorage, ClaudeCodeStorageConfig};
@@ -140,11 +143,22 @@ pub async fn build_plexus_rpc() -> Arc<DynamicHub> {
         // Store a clone for the post-construction recovery pass.
         let _ = orcha_for_recovery.set(orcha.clone());
 
+        // Construct the mneme context: the substrate-side handles every
+        // skill activation needs. ClaudeCodeSwarmRuntime drives in-process
+        // fork+chat against the same claudecode instance the hub serves.
+        let claudecode_arc = Arc::new(claudecode.clone());
+        let swarm_runtime = Arc::new(ClaudeCodeSwarmRuntime::new(claudecode_arc));
+        let mneme_context = Arc::new(MnemeContext::new("./programs", swarm_runtime));
+
+        // mneme skills wired with the shared context.
+        let forecast = Forecast::new(mneme_context.clone());
+
         // Build and return the DynamicHub with "substrate" namespace
         let hub = DynamicHub::new("substrate")
             .register(Health::new())
             .register(Echo::new())
-            .register(Bash::new());
+            .register(Bash::new())
+            .register(forecast);
 
         // Chaos activation is feature-gated — off by default because it pulls
         // in libc + narrow unsafe signal primitives.

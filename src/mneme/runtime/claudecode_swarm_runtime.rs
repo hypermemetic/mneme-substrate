@@ -18,9 +18,9 @@ use futures::StreamExt;
 use plexus_core::plexus::HubContext;
 use serde_json::Value;
 
-use crate::activations::claudecode::{ChatEvent, ClaudeCode, ForkResult};
+use crate::activations::claudecode::{ChatEvent, ClaudeCode, CreateResult, ForkResult, GetResult, Model};
 use crate::mneme::program::{Program, TraceEntry, TraceOp, TraceOutcome};
-use crate::mneme::runtime::swarm_runtime::{SwarmError, SwarmRuntime, TrialParams};
+use crate::mneme::runtime::swarm_runtime::{ParentSessionSpec, SwarmError, SwarmRuntime, TrialParams};
 use crate::mneme::swarm::{TrialBatch, TrialFailure, TrialResult};
 
 /// Production `SwarmRuntime` impl. Wraps a shared `ClaudeCode` activation
@@ -43,6 +43,52 @@ impl<P: HubContext + 'static> std::fmt::Debug for ClaudeCodeSwarmRuntime<P> {
 
 #[async_trait::async_trait]
 impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
+    /// Idempotent: looks up the session by name; if found, returns. If not,
+    /// creates it with the provided spec.
+    async fn ensure_parent_session(&self, spec: ParentSessionSpec) -> Result<(), SwarmError> {
+        // Fast path: already exists.
+        let get_stream = self.claudecode.get(spec.name.clone()).await;
+        let mut get_stream = Box::pin(get_stream);
+        if let Some(GetResult::Ok { .. }) = get_stream.next().await {
+            return Ok(());
+        }
+        // Slow path: create.
+        let model = match spec.model.as_str() {
+            "opus" => Model::Opus,
+            "sonnet" => Model::Sonnet,
+            "haiku" => Model::Haiku,
+            other => {
+                return Err(SwarmError::NotImplemented(Box::leak(
+                    format!("unknown model `{}`; expected opus/sonnet/haiku", other)
+                        .into_boxed_str(),
+                )))
+            }
+        };
+        let create_stream = self
+            .claudecode
+            .create(
+                spec.name.clone(),
+                spec.working_dir.clone(),
+                model,
+                Some(spec.system_prompt),
+                None,
+                None,
+            )
+            .await;
+        let mut create_stream = Box::pin(create_stream);
+        match create_stream.next().await {
+            Some(CreateResult::Ok { .. }) => Ok(()),
+            Some(CreateResult::Err { message }) => {
+                Err(SwarmError::NotImplemented(Box::leak(
+                    format!("create session `{}`: {}", spec.name, message).into_boxed_str(),
+                )))
+            }
+            None => Err(SwarmError::NotImplemented(
+                "create returned no result",
+            )),
+        }
+    }
+
     async fn trial(
         &self,
         program: &Program,

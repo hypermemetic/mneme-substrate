@@ -691,9 +691,10 @@ impl<P: HubContext> ClaudeCode<P> {
         }
     }
 
-    /// Get session configuration details
+    /// Get session configuration details.
+    /// `pub` so in-process callers can probe for session existence.
     #[plexus_macros::method]
-    async fn get(&self, name: String) -> impl Stream<Item = GetResult> + Send + 'static {
+    pub async fn get(&self, name: String) -> impl Stream<Item = GetResult> + Send + 'static {
         let result = self.storage.session_get_by_name(&name).await;
 
         stream! {

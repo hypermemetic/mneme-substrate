@@ -20,8 +20,15 @@ use serde_json::json;
 
 use super::types::*;
 use crate::mneme::context::MnemeContext;
-use crate::mneme::runtime::swarm_runtime::TrialParams;
+use crate::mneme::runtime::swarm_runtime::{ParentSessionSpec, TrialParams};
 use crate::mneme::swarm::aggregate::{aggregate, AggregationRule};
+
+/// The forecasting skill prompt. Loaded into the parent claudecode session
+/// as the system prompt so each trial reasons inside the BLF framing without
+/// the activation having to repeat it in every prompt.
+const FORECAST_SKILL_MD: &str = include_str!(
+    "../../../../skills/skills/forecast/SKILL.md"
+);
 
 const DEFAULT_TRIALS: u8 = 3;
 const DEFAULT_LAMBDA: f64 = 0.2;
@@ -172,6 +179,23 @@ impl Forecast {
                 }
             };
             let update_program_id = program.id().to_string();
+
+            // Ensure the parent session exists with the forecast SKILL.md as
+            // its system prompt. Idempotent — no-op if already created.
+            let spec = ParentSessionSpec {
+                name: parent_session.clone(),
+                system_prompt: FORECAST_SKILL_MD.to_string(),
+                working_dir: context.programs_root().to_string_lossy().to_string(),
+                model: "sonnet".to_string(),
+            };
+            if let Err(e) = context.swarm().ensure_parent_session(spec).await {
+                let _ = program.close_failed("EnsureSession", &e.to_string(), "ensure_parent_session").await;
+                yield UpdateEvent::Error {
+                    stage: "ensure_parent_session".into(),
+                    message: e.to_string(),
+                };
+                return;
+            }
 
             // Spawn the actual work in the background. The stream returns
             // immediately after yielding Started; the background task drives

@@ -91,12 +91,34 @@ impl TrialParams {
     }
 }
 
+/// Settings for ensuring a parent claudecode session exists, used by
+/// [`SwarmRuntime::ensure_parent_session`].
+#[derive(Debug, Clone)]
+pub struct ParentSessionSpec {
+    /// Session name; created if it doesn't exist.
+    pub name: String,
+    /// System prompt loaded into the session (typically the skill's SKILL.md).
+    pub system_prompt: String,
+    /// Working directory the session runs claude in.
+    pub working_dir: String,
+    /// Model name (opus / sonnet / haiku).
+    pub model: String,
+}
+
 /// The runtime trait. Real implementation drives claudecode; tests use mocks.
 #[async_trait::async_trait]
 pub trait SwarmRuntime: Send + Sync {
     /// Execute a swarm.trial fan-out against `program`'s context. Records a
     /// trace entry on the program when complete.
     async fn trial(&self, program: &Program, params: TrialParams) -> Result<TrialBatch, SwarmError>;
+
+    /// Ensure a parent claudecode session exists with the given system prompt
+    /// and working dir. If the session already exists, this is a no-op
+    /// (regardless of whether the existing session's system prompt matches).
+    /// Stub/mock impls return Ok(()).
+    async fn ensure_parent_session(&self, _spec: ParentSessionSpec) -> Result<(), SwarmError> {
+        Ok(())
+    }
 }
 
 /// Pure aggregation — no runtime needed. Wraps the underlying math so callers

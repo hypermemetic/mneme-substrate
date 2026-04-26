@@ -281,7 +281,7 @@ mod tests {
         ))
         .unwrap();
         let joined = join_market_questions(&qs.questions, &rs.resolutions);
-        let r = run_backtest(&joined, None, freeze_value_forecaster()).await;
+        let r = run_backtest(&joined, None, 1, freeze_value_forecaster()).await;
         eprintln!(
             "crowd baseline (freeze_datetime_value) on {} resolved questions:",
             r.predictions.len()

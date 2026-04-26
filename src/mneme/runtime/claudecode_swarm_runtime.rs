@@ -106,44 +106,58 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
         params.validate()?;
 
         let start = Instant::now();
+
+        // Spawn all trials concurrently. Per MNEME-24, sequential trials were
+        // the single biggest wall-clock blocker — K=N took N× the per-trial
+        // wall clock. Each trial forks the parent session independently and
+        // runs its own chat loop; claudecode supports concurrent forks.
+        let trial_futures = (0..params.n).map(|trial_index| {
+            let claudecode = self.claudecode.clone();
+            let parent_session = params.parent_session.clone();
+            let trial_session_name = format!("{}-trial-{}", program.id(), trial_index);
+            let prompt = compose_prompt(&params.prompt, params.diversify.as_deref(), trial_index);
+            let timeout = params.timeout;
+            let allowed_tools = params.allowed_tools.clone();
+            let iterative = params.iterative_max_steps;
+            async move {
+                let trial_start = Instant::now();
+                let outcome = match iterative {
+                    Some(t_max) => {
+                        run_iterative_trial(
+                            claudecode,
+                            parent_session,
+                            trial_session_name.clone(),
+                            prompt,
+                            t_max,
+                            timeout,
+                            allowed_tools,
+                        )
+                        .await
+                    }
+                    None => {
+                        run_one_trial(
+                            claudecode,
+                            parent_session,
+                            trial_session_name.clone(),
+                            prompt,
+                            timeout,
+                            allowed_tools,
+                        )
+                        .await
+                    }
+                };
+                (trial_index, trial_session_name, trial_start.elapsed(), outcome)
+            }
+        });
+
+        let trial_results: Vec<_> = futures::future::join_all(trial_futures).await;
+
         let mut successes = Vec::with_capacity(params.n as usize);
         let mut failures = Vec::with_capacity(params.n as usize);
         let mut child_session_ids = Vec::with_capacity(params.n as usize);
 
-        for trial_index in 0..params.n {
-            let trial_session_name =
-                format!("{}-trial-{}", program.id(), trial_index);
-
-            let prompt = compose_prompt(&params.prompt, params.diversify.as_deref(), trial_index);
-            let trial_start = Instant::now();
-
-            let trial_outcome = match params.iterative_max_steps {
-                Some(t_max) => {
-                    run_iterative_trial(
-                        self.claudecode.clone(),
-                        params.parent_session.clone(),
-                        trial_session_name.clone(),
-                        prompt,
-                        t_max,
-                        params.timeout,
-                        params.allowed_tools.clone(),
-                    )
-                    .await
-                }
-                None => {
-                    run_one_trial(
-                        self.claudecode.clone(),
-                        params.parent_session.clone(),
-                        trial_session_name.clone(),
-                        prompt,
-                        params.timeout,
-                        params.allowed_tools.clone(),
-                    )
-                    .await
-                }
-            };
-
-            match trial_outcome {
+        for (trial_index, trial_session_name, elapsed, outcome) in trial_results {
+            match outcome {
                 Ok((text, usage)) => {
                     child_session_ids.push(trial_session_name.clone());
                     let response = parse_response(&text);
@@ -151,7 +165,7 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
                         trial_index,
                         session_id: trial_session_name,
                         response,
-                        duration_ms: trial_start.elapsed().as_millis() as u64,
+                        duration_ms: elapsed.as_millis() as u64,
                         usage,
                     });
                 }
@@ -171,6 +185,9 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
                 }
             }
         }
+        // Restore deterministic ordering by trial_index for caller convenience.
+        successes.sort_by_key(|s| s.trial_index);
+        failures.sort_by_key(|f| f.trial_index);
 
         // Sum per-trial usage so the trace entry surfaces total tokens / cost
         // for this swarm fan-out. Trials with `usage == None` (mock runtimes,

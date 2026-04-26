@@ -751,9 +751,12 @@ impl<P: HubContext> ClaudeCode<P> {
         }
     }
 
-    /// Fork a session to create a branch point
+    /// Fork a session to create a branch point.
+    ///
+    /// `pub` so in-process callers (e.g., the mneme swarm runtime) can drive
+    /// fan-out via direct Rust calls rather than re-entering Plexus dispatch.
     #[plexus_macros::method]
-    async fn fork(
+    pub async fn fork(
         &self,
         name: String,
         new_name: String,

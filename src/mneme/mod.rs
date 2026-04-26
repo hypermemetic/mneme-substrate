@@ -12,9 +12,10 @@
 //! these modules compose via normal Rust function calls. See the architecture
 //! diagram in the sibling `mneme/` repo's README.
 
-pub mod program;
-pub mod swarm;
-pub mod respond;
 pub mod calibration;
+pub mod program;
+pub mod respond;
+pub mod runtime;
+pub mod swarm;
 
 pub use program::{Program, ProgramDirectory, ProgramError, ProgramId, ProgramStatus};

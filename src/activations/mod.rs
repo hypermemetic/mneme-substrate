@@ -45,3 +45,6 @@ pub mod lattice;
 
 // Changelog tracks plexus hash transitions and planned changes
 pub mod changelog;
+
+// Forecast — mneme's BLF binary forecasting skill (skeleton; needs SwarmRuntime wiring)
+pub mod forecast;

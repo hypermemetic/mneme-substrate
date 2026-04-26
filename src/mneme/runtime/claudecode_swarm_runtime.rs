@@ -19,7 +19,9 @@ use plexus_core::plexus::HubContext;
 use serde_json::Value;
 
 use crate::activations::claudecode::{ChatEvent, ChatUsage, ClaudeCode, CreateResult, ForkResult, GetResult, Model};
+use crate::activations::forecast::iterative_trial;
 use crate::mneme::program::{Program, TraceEntry, TraceOp, TraceOutcome};
+use crate::mneme::runtime::claudecode_step_driver::ClaudecodeStepDriver;
 use crate::mneme::runtime::swarm_runtime::{ParentSessionSpec, SwarmError, SwarmRuntime, TrialParams};
 use crate::mneme::swarm::{TrialBatch, TrialFailure, TrialResult, TrialUsage};
 
@@ -115,16 +117,33 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
             let prompt = compose_prompt(&params.prompt, params.diversify.as_deref(), trial_index);
             let trial_start = Instant::now();
 
-            match run_one_trial(
-                self.claudecode.clone(),
-                params.parent_session.clone(),
-                trial_session_name.clone(),
-                prompt,
-                params.timeout,
-                params.allowed_tools.clone(),
-            )
-            .await
-            {
+            let trial_outcome = match params.iterative_max_steps {
+                Some(t_max) => {
+                    run_iterative_trial(
+                        self.claudecode.clone(),
+                        params.parent_session.clone(),
+                        trial_session_name.clone(),
+                        prompt,
+                        t_max,
+                        params.timeout,
+                        params.allowed_tools.clone(),
+                    )
+                    .await
+                }
+                None => {
+                    run_one_trial(
+                        self.claudecode.clone(),
+                        params.parent_session.clone(),
+                        trial_session_name.clone(),
+                        prompt,
+                        params.timeout,
+                        params.allowed_tools.clone(),
+                    )
+                    .await
+                }
+            };
+
+            match trial_outcome {
                 Ok((text, usage)) => {
                     child_session_ids.push(trial_session_name.clone());
                     let response = parse_response(&text);
@@ -137,6 +156,12 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
                     });
                 }
                 Err(error) => {
+                    tracing::error!(
+                        trial_index,
+                        session = %trial_session_name,
+                        "trial failed: {}",
+                        error
+                    );
                     failures.push(TrialFailure {
                         trial_index,
                         session_id: Some(trial_session_name),
@@ -164,8 +189,10 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
                 "n": params.n,
                 "parent_session": params.parent_session,
                 "diversify": params.diversify,
+                "iterative_max_steps": params.iterative_max_steps,
                 "usage_total": usage_total,
                 "trials_with_usage": trials_with_usage,
+                "failure_messages": failures.iter().map(|f| &f.error).collect::<Vec<_>>(),
             }),
             child_session_ids,
             if failures.is_empty() { TraceOutcome::Ok } else { TraceOutcome::Err },
@@ -251,6 +278,59 @@ fn chat_usage_to_trial_usage(u: ChatUsage) -> TrialUsage {
         output_tokens: u.output_tokens,
         cost_usd: u.cost_usd,
         num_turns: u.num_turns,
+    }
+}
+
+/// Drive one trial as an iterative BLF loop (Murphy 2026 Algorithm 1).
+/// Forks the parent session, then runs `iterative_trial<ClaudecodeStepDriver>`
+/// which sends one chat per step and parses (action, belief) from each
+/// response. Returns the final belief serialized as JSON for downstream
+/// aggregation, plus the accumulated per-step token usage.
+async fn run_iterative_trial<P: HubContext + 'static>(
+    claudecode: Arc<ClaudeCode<P>>,
+    parent: String,
+    new_name: String,
+    initial_question: String,
+    max_steps: u8,
+    timeout: Duration,
+    allowed_tools: Option<Vec<String>>,
+) -> Result<(String, Option<TrialUsage>), String> {
+    // Fork the parent session for this trial.
+    let fork_stream = claudecode.fork(parent.clone(), new_name.clone()).await;
+    let mut fork_stream = Box::pin(fork_stream);
+    match fork_stream.next().await {
+        Some(ForkResult::Ok { .. }) => {}
+        Some(ForkResult::Err { message }) => return Err(format!("fork failed: {}", message)),
+        None => return Err("fork returned no result".into()),
+    }
+
+    // Default tools (WebSearch + Read) when caller didn't specify — same
+    // policy as single-shot run_one_trial.
+    let allowed_tools = allowed_tools.or_else(|| {
+        Some(vec!["WebSearch".to_string(), "Read".to_string()])
+    });
+
+    let mut driver =
+        ClaudecodeStepDriver::new(claudecode, new_name.clone(), allowed_tools);
+
+    let loop_future = async {
+        iterative_trial(&mut driver, &initial_question, max_steps).await
+    };
+
+    match tokio::time::timeout(timeout, loop_future).await {
+        Ok(Ok((belief, _history))) => {
+            let belief_json = serde_json::to_string(&belief)
+                .map_err(|e| format!("serialize belief: {}", e))?;
+            let usage = driver.into_usage();
+            let usage_opt = if usage == TrialUsage::default() {
+                None
+            } else {
+                Some(usage)
+            };
+            Ok((belief_json, usage_opt))
+        }
+        Ok(Err(loop_err)) => Err(format!("iterative trial: {}", loop_err)),
+        Err(_) => Err(format!("iterative trial timed out after {:?}", timeout)),
     }
 }
 

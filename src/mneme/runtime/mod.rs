@@ -29,6 +29,7 @@
 //! See `mneme/plans/MNEME/MNEME-3.md` (respond), `MNEME-4.md` (swarm.trial),
 //! `MNEME-7.md` (recording integration) for the full contracts.
 
+pub mod claudecode_step_driver;
 pub mod claudecode_swarm_runtime;
 pub mod program_runtime;
 pub mod session_attribution;

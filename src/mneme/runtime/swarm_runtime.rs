@@ -77,6 +77,10 @@ pub struct TrialParams {
     /// (currently WebSearch + Read). Empty Vec = no tools. Specific list
     /// = exactly those tools.
     pub allowed_tools: Option<Vec<String>>,
+    /// If `Some(t_max)`, run each trial as an iterative BLF loop with up to
+    /// `t_max` steps (Murphy 2026 Algorithm 1). If `None`, run each trial as
+    /// a single chat call (legacy / regression-comparison mode).
+    pub iterative_max_steps: Option<u8>,
 }
 
 impl TrialParams {
@@ -251,6 +255,7 @@ mod tests {
             diversify: None,
             timeout: Duration::from_secs(10),
             allowed_tools: None,
+            iterative_max_steps: None,
         };
         assert!(matches!(p.validate(), Err(SwarmError::NCap { .. })));
     }
@@ -265,6 +270,7 @@ mod tests {
             diversify: None,
             timeout: Duration::from_secs(10),
             allowed_tools: None,
+            iterative_max_steps: None,
         };
         assert!(matches!(p.validate(), Err(SwarmError::NCap { .. })));
     }
@@ -279,6 +285,7 @@ mod tests {
             diversify: None,
             timeout: Duration::from_secs(10),
             allowed_tools: None,
+            iterative_max_steps: None,
         };
         p.validate().unwrap();
     }
@@ -309,6 +316,7 @@ mod tests {
             diversify: None,
             timeout: Duration::from_secs(10),
             allowed_tools: None,
+            iterative_max_steps: None,
         };
         let err = stub.trial(&prog, params).await.unwrap_err();
         assert!(matches!(err, SwarmError::NotImplemented(_)));
@@ -332,6 +340,7 @@ mod tests {
             diversify: None,
             timeout: Duration::from_secs(10),
             allowed_tools: None,
+            iterative_max_steps: None,
         };
         let batch = mock.trial(&prog, params).await.unwrap();
         assert_eq!(batch.success_count(), 3);
@@ -356,6 +365,7 @@ mod tests {
             diversify: None,
             timeout: Duration::from_secs(10),
             allowed_tools: None,
+            iterative_max_steps: None,
         };
         let batch = mock.trial(&prog, params).await.unwrap();
         assert_eq!(batch.success_count(), 1);
@@ -424,6 +434,7 @@ mod tests {
             diversify: Some("Reasoning style #%i (analytic / contrarian / base-rate)".into()),
             timeout: Duration::from_secs(10),
             allowed_tools: None,
+            iterative_max_steps: None,
         };
         let batch = mock.trial(&prog, params).await.unwrap();
         assert_eq!(batch.success_count(), 3);

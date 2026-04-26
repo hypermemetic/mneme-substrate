@@ -43,14 +43,26 @@ pub enum LoopError {
     NoBelief,
 }
 
+/// Context the loop hands the driver each step. The driver decides what
+/// to put on the wire — for claudecode the driver may emit only the latest
+/// observation (since the session retains history server-side); for
+/// stateless mocks the driver can use [`build_step_prompt`] to render
+/// the full history into the prompt.
+pub struct StepContext<'a> {
+    pub initial_question: &'a str,
+    pub step_idx: u8,
+    pub max_steps: u8,
+    pub history: &'a [HistoryEntry],
+}
+
 /// Pluggable per-step driver. Production wires this to a long-running
 /// claudecode session (one chat call per step). Tests dispense canned
 /// responses via [`QueueStepDriver`].
 #[async_trait]
 pub trait StepDriver: Send {
-    /// Send `prompt` to the LLM, await the response text. The text is then
-    /// passed through [`parse_step`] by the loop.
-    async fn next_step(&mut self, prompt: &str) -> Result<String, String>;
+    /// Send the next step to the LLM, await the response text. The text is
+    /// then passed through [`parse_step`] by the loop.
+    async fn next_step(&mut self, ctx: StepContext<'_>) -> Result<String, String>;
 }
 
 /// Run the iterative trial loop against `driver`.
@@ -67,11 +79,13 @@ pub async fn iterative_trial<D: StepDriver>(
     let mut last_belief: Option<TrialResponse> = None;
 
     for step_idx in 0..max_steps {
-        let prompt = build_step_prompt(initial_question, &history, step_idx, max_steps);
-        let raw = driver
-            .next_step(&prompt)
-            .await
-            .map_err(LoopError::Driver)?;
+        let ctx = StepContext {
+            initial_question,
+            step_idx,
+            max_steps,
+            history: &history,
+        };
+        let raw = driver.next_step(ctx).await.map_err(LoopError::Driver)?;
         let parsed = parse_step(&raw).map_err(|source| LoopError::Parse {
             step: step_idx,
             source,
@@ -157,8 +171,15 @@ impl QueueStepDriver {
 
 #[async_trait]
 impl StepDriver for QueueStepDriver {
-    async fn next_step(&mut self, prompt: &str) -> Result<String, String> {
-        self.seen_prompts.push(prompt.to_string());
+    async fn next_step(&mut self, ctx: StepContext<'_>) -> Result<String, String> {
+        // Render the full-history prompt for inspection so tests can assert
+        // on what the loop was building.
+        self.seen_prompts.push(build_step_prompt(
+            ctx.initial_question,
+            ctx.history,
+            ctx.step_idx,
+            ctx.max_steps,
+        ));
         self.responses
             .pop_front()
             .ok_or_else(|| "queue exhausted".to_string())

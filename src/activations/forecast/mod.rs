@@ -13,7 +13,8 @@ pub use agent_loop::{
     TimeSeriesPoint,
 };
 pub use iterative_loop::{
-    build_step_prompt, iterative_trial, HistoryEntry, LoopError, QueueStepDriver, StepDriver,
+    build_step_prompt, iterative_trial, HistoryEntry, LoopError, QueueStepDriver, StepContext,
+    StepDriver,
 };
 pub use types::{
     CreateEvent, EvidenceItem, ForecastConfidence, ForecastState, PriorRef, ResolveEvent,

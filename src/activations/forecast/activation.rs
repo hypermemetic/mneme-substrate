@@ -16,7 +16,7 @@ use std::time::Duration;
 use async_stream::stream;
 use chrono::{DateTime, NaiveDate, Utc};
 use futures::Stream;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::types::*;
 use crate::mneme::context::MnemeContext;
@@ -154,7 +154,8 @@ impl Forecast {
         new_evidence = "Free-form evidence to condition this update on (may be empty)",
         trials = "Number of trials for this update (1..=16, defaults to 3)",
         parent_session = "Optional parent claudecode session name; defaults to 'forecast-parent'",
-        allowed_tools = "Optional list of tools to allow per trial (e.g. [\"WebSearch\", \"Read\"]); None uses the runtime default"
+        allowed_tools = "Optional list of tools to allow per trial (e.g. [\"WebSearch\", \"Read\"]); None uses the runtime default",
+        iterative_max_steps = "If Some, run each trial as an iterative BLF loop with up to N steps (Murphy 2026 Algorithm 1). If None or 0, run as a single chat call (legacy mode). Default None."
     ))]
     async fn update(
         &self,
@@ -163,6 +164,7 @@ impl Forecast {
         trials: Option<u8>,
         parent_session: Option<String>,
         allowed_tools: Option<Vec<String>>,
+        iterative_max_steps: Option<u8>,
     ) -> impl Stream<Item = UpdateEvent> + Send + 'static {
         let context = self.context.clone();
         stream! {
@@ -232,6 +234,7 @@ impl Forecast {
                 trials,
                 resolved_parent,
                 allowed_tools,
+                iterative_max_steps,
             ));
 
             yield UpdateEvent::Started {
@@ -241,10 +244,12 @@ impl Forecast {
         }
     }
 
-    /// Record the ground truth outcome of a resolved forecast.
-    ///
-    /// Stub for now — the calibration store wiring lands when the resolve
-    /// pipeline is needed.
+    /// Record the ground truth outcome of a resolved forecast. Reads the
+    /// program's artifact, extracts the predicted probability, and appends
+    /// a [`crate::mneme::calibration::ResolvedObservation`] to the
+    /// substrate's calibration store at `programs_root/_calibration/`.
+    /// If the post-append history crosses [`crate::mneme::calibration::COLD_START_THRESHOLD`],
+    /// emits a `Recalibrated` event with the newly-fit Platt parameters.
     #[plexus_macros::method(params(
         program_id = "Program id of the forecast being resolved",
         actual = "Whether the predicted event happened",
@@ -256,11 +261,93 @@ impl Forecast {
         actual: bool,
         resolved_at: Option<String>,
     ) -> impl Stream<Item = ResolveEvent> + Send + 'static {
-        let _ = (program_id, actual, resolved_at);
+        let context = self.context.clone();
         stream! {
-            yield ResolveEvent::Error {
-                message: "forecast.resolve is not yet wired to the calibration store".to_string(),
+            let resolved_at_dt = match resolved_at.as_deref() {
+                None => Utc::now(),
+                Some(s) => match DateTime::parse_from_rfc3339(s) {
+                    Ok(dt) => dt.with_timezone(&Utc),
+                    Err(e) => {
+                        yield ResolveEvent::Error {
+                            message: format!("could not parse resolved_at `{}`: {}", s, e),
+                        };
+                        return;
+                    }
+                },
             };
+
+            // Look up the predicted probability from the program's artifact.
+            let artifact_path = context
+                .programs_root()
+                .join(&program_id)
+                .join("artifact.json");
+            let predicted = match std::fs::read(&artifact_path) {
+                Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(v) => match v.get("probability").and_then(|p| p.as_f64()) {
+                        Some(p) => p,
+                        None => {
+                            yield ResolveEvent::Error {
+                                message: format!(
+                                    "artifact at {} has no `probability` field",
+                                    artifact_path.display()
+                                ),
+                            };
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        yield ResolveEvent::Error {
+                            message: format!("artifact JSON parse: {}", e),
+                        };
+                        return;
+                    }
+                },
+                Err(e) => {
+                    yield ResolveEvent::Error {
+                        message: format!("could not read {}: {}", artifact_path.display(), e),
+                    };
+                    return;
+                }
+            };
+
+            // Open the calibration store and record.
+            let calibration_root = context.programs_root().join("_calibration");
+            let store = match crate::mneme::calibration::CalibrationStore::open(&calibration_root) {
+                Ok(s) => s,
+                Err(e) => {
+                    yield ResolveEvent::Error {
+                        message: format!("calibration store open: {}", e),
+                    };
+                    return;
+                }
+            };
+            let obs = crate::mneme::calibration::ResolvedObservation {
+                program_id: program_id.clone(),
+                predicted,
+                actual,
+                deadline: None,
+                resolved_at: resolved_at_dt,
+            };
+            if let Err(e) = store.record(&obs) {
+                yield ResolveEvent::Error {
+                    message: format!("calibration store record: {}", e),
+                };
+                return;
+            }
+
+            yield ResolveEvent::Resolved {
+                program_id,
+                predicted,
+                actual,
+            };
+
+            // If `record` re-fit the bias (post-cold-start), surface it.
+            if let Ok(Some(params)) = store.read_bias() {
+                yield ResolveEvent::Recalibrated {
+                    a: params.a,
+                    b: params.b,
+                };
+            }
         }
     }
 }
@@ -275,6 +362,7 @@ async fn run_update_in_background(
     trials: u8,
     parent_session: String,
     allowed_tools: Option<Vec<String>>,
+    iterative_max_steps: Option<u8>,
 ) {
     let prompt = format!(
         "Forecast update for question program {}.\n\nNew evidence:\n{}\n\nReturn a JSON object with fields `probability` (a number in [0,1]) and `summary` (a one-paragraph evidence summary).",
@@ -289,6 +377,10 @@ async fn run_update_in_background(
         "required": ["probability", "summary"]
     });
 
+    // Treat Some(0) as "single-shot" (None) so callers can pass 0 to opt out
+    // explicitly without juggling Option semantics over the wire.
+    let iterative = iterative_max_steps.filter(|t| *t > 0);
+
     let params = TrialParams {
         parent_session,
         prompt,
@@ -297,6 +389,7 @@ async fn run_update_in_background(
         diversify: Some("Reasoning style #%i (analytic / contrarian / base-rate-grounded)".into()),
         timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         allowed_tools,
+        iterative_max_steps: iterative,
     };
 
     let batch = match context.swarm().trial(&program, params).await {
@@ -514,7 +607,7 @@ mod tests {
             json!({"probability": 0.7, "summary": "trial 2"}),
         ]);
         let stream = forecast
-            .update("Q-001".into(), "evidence".into(), Some(2), None, None)
+            .update("Q-001".into(), "evidence".into(), Some(2), None, None, None)
             .await;
         let mut s = Box::pin(stream);
         let evt = s.next().await.expect("event");
@@ -534,7 +627,7 @@ mod tests {
     async fn update_with_stub_runtime_closes_program_as_failed() {
         let (dir, forecast) = forecast_with_stub();
         let stream = forecast
-            .update("Q-001".into(), "evidence".into(), None, None, None)
+            .update("Q-001".into(), "evidence".into(), None, None, None, None)
             .await;
         let mut s = Box::pin(stream);
         let evt = s.next().await.expect("event");
@@ -550,7 +643,7 @@ mod tests {
     async fn update_validation_error_does_not_open_program() {
         let (_dir, forecast) = forecast_with_stub();
         let stream = forecast
-            .update("Q-001".into(), "evidence".into(), Some(99), None, None)
+            .update("Q-001".into(), "evidence".into(), Some(99), None, None, None)
             .await;
         let mut s = Box::pin(stream);
         let evt = s.next().await.expect("event");
@@ -561,12 +654,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_returns_not_wired_error() {
+    async fn resolve_errors_when_program_artifact_missing() {
         let (_dir, forecast) = forecast_with_stub();
-        let stream = forecast.resolve("p1".into(), true, None).await;
+        let stream = forecast.resolve("nope".into(), true, None).await;
         let mut s = Box::pin(stream);
-        let evt = s.next().await.expect("event");
-        assert!(matches!(evt, ResolveEvent::Error { .. }));
+        match s.next().await.expect("event") {
+            ResolveEvent::Error { message } => {
+                assert!(message.contains("could not read"), "got: {}", message);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_records_observation_and_yields_resolved() {
+        // Run an update first so an artifact exists, then resolve it.
+        let (dir, forecast) = forecast_with_mock(vec![
+            json!({"probability": 0.62, "summary": "trial 0"}),
+            json!({"probability": 0.55, "summary": "trial 1"}),
+        ]);
+        let stream = forecast
+            .update("Q-RESOLVE-001".into(), "evidence".into(), Some(2), None, None, None)
+            .await;
+        let mut s = Box::pin(stream);
+        let evt = s.next().await.expect("update started");
+        let program_id = match evt {
+            UpdateEvent::Started { program_id, .. } => program_id,
+            other => panic!("unexpected: {:?}", other),
+        };
+        let _ = await_program_status(dir.path(), &program_id, std::time::Duration::from_secs(5)).await;
+
+        // Read the predicted probability for the assertion.
+        let artifact_bytes = std::fs::read(dir.path().join(&program_id).join("artifact.json")).unwrap();
+        let artifact: Value = serde_json::from_slice(&artifact_bytes).unwrap();
+        let predicted_in_artifact = artifact["probability"].as_f64().unwrap();
+
+        // Resolve.
+        let stream = forecast.resolve(program_id.clone(), true, None).await;
+        let mut s = Box::pin(stream);
+        match s.next().await.expect("resolve event") {
+            ResolveEvent::Resolved { program_id: pid, predicted, actual } => {
+                assert_eq!(pid, program_id);
+                assert!((predicted - predicted_in_artifact).abs() < 1e-9);
+                assert!(actual);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+
+        // Calibration store should have one row.
+        let store = crate::mneme::calibration::CalibrationStore::open(
+            dir.path().join("_calibration"),
+        ).unwrap();
+        let history = store.read_history().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].program_id, program_id);
+        assert!(history[0].actual);
     }
 
     #[test]

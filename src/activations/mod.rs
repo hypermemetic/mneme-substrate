@@ -48,3 +48,15 @@ pub mod changelog;
 
 // Forecast — mneme's BLF binary forecasting skill (skeleton; needs SwarmRuntime wiring)
 pub mod forecast;
+
+// Ticketing — writes TDD tickets that pass the two-stranger test (skeleton)
+pub mod ticketing;
+
+// Planning — breaks goals into dependency DAGs of tickets (skeleton)
+pub mod planning;
+
+// Security Review — structured security audits grouped by SOC2 control families (skeleton)
+pub mod security_review;
+
+// Strong Typing — proposes newtypes for bare identifiers (skeleton)
+pub mod strong_typing;

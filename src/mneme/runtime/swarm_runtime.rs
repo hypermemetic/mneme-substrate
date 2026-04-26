@@ -95,7 +95,10 @@ impl TrialParams {
 /// [`SwarmRuntime::ensure_parent_session`].
 #[derive(Debug, Clone)]
 pub struct ParentSessionSpec {
-    /// Session name; created if it doesn't exist.
+    /// User-provided logical session name; the actual underlying session name
+    /// is derived deterministically as `{name}-skill{8hex(sha256(system_prompt))}`
+    /// so that changes to the system prompt produce a different name and
+    /// trigger a clean recreate (MNEME-21).
     pub name: String,
     /// System prompt loaded into the session (typically the skill's SKILL.md).
     pub system_prompt: String,
@@ -103,6 +106,19 @@ pub struct ParentSessionSpec {
     pub working_dir: String,
     /// Model name (opus / sonnet / haiku).
     pub model: String,
+}
+
+impl ParentSessionSpec {
+    /// Compute the underlying claudecode session name. Includes a content hash
+    /// of `system_prompt` so that changes to the SKILL.md produce a fresh
+    /// session rather than reusing a stale one.
+    pub fn resolved_name(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.system_prompt.as_bytes());
+        let hex = hex::encode(hasher.finalize());
+        format!("{}-skill{}", self.name, &hex[..8])
+    }
 }
 
 /// The runtime trait. Real implementation drives claudecode; tests use mocks.
@@ -187,6 +203,7 @@ impl SwarmRuntime for DeterministicMockSwarmRuntime {
                 session_id,
                 response,
                 duration_ms: 1,
+                usage: None,
             });
         }
         let failures = (take..n)

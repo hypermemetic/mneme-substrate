@@ -46,6 +46,11 @@ output.log
 substrate.log*
 logs/
 
+# Per-run mneme program state (artifacts, manifests, trace.jsonl per program_id).
+# These accumulate quickly and are reproducible; bench evidence lives in
+# `mneme/plans/BLFX/results/`.
+programs/
+
 # TLA+ model checker artifacts
 plans/tla2tools.jar
 plans/states/

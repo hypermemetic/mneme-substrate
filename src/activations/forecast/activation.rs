@@ -198,13 +198,19 @@ impl Forecast {
             let update_program_id = program.id().to_string();
 
             // Ensure the parent session exists with the forecast SKILL.md as
-            // its system prompt. Idempotent — no-op if already created.
+            // its system prompt. ParentSessionSpec hashes the system_prompt
+            // into the actual underlying session name (MNEME-21), so SKILL.md
+            // changes produce a fresh session rather than inheriting the
+            // stale prompt from a previous substrate run.
             let spec = ParentSessionSpec {
                 name: parent_session.clone(),
                 system_prompt: FORECAST_SKILL_MD.to_string(),
                 working_dir: context.programs_root().to_string_lossy().to_string(),
                 model: "sonnet".to_string(),
             };
+            // The trial fan-out needs the resolved name; both ensure and trial
+            // see the same content-hashed name for the same SKILL.md.
+            let resolved_parent = spec.resolved_name();
             if let Err(e) = context.swarm().ensure_parent_session(spec).await {
                 let _ = program.close_failed("EnsureSession", &e.to_string(), "ensure_parent_session").await;
                 yield UpdateEvent::Error {
@@ -224,7 +230,7 @@ impl Forecast {
                 program_id.clone(),
                 new_evidence,
                 trials,
-                parent_session,
+                resolved_parent,
                 allowed_tools,
             ));
 

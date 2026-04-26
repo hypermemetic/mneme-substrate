@@ -18,10 +18,10 @@ use futures::StreamExt;
 use plexus_core::plexus::HubContext;
 use serde_json::Value;
 
-use crate::activations::claudecode::{ChatEvent, ClaudeCode, CreateResult, ForkResult, GetResult, Model};
+use crate::activations::claudecode::{ChatEvent, ChatUsage, ClaudeCode, CreateResult, ForkResult, GetResult, Model};
 use crate::mneme::program::{Program, TraceEntry, TraceOp, TraceOutcome};
 use crate::mneme::runtime::swarm_runtime::{ParentSessionSpec, SwarmError, SwarmRuntime, TrialParams};
-use crate::mneme::swarm::{TrialBatch, TrialFailure, TrialResult};
+use crate::mneme::swarm::{TrialBatch, TrialFailure, TrialResult, TrialUsage};
 
 /// Production `SwarmRuntime` impl. Wraps a shared `ClaudeCode` activation
 /// instance and uses its public `fork` + `chat` methods for each trial.
@@ -43,16 +43,23 @@ impl<P: HubContext + 'static> std::fmt::Debug for ClaudeCodeSwarmRuntime<P> {
 
 #[async_trait::async_trait]
 impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
-    /// Idempotent: looks up the session by name; if found, returns. If not,
-    /// creates it with the provided spec.
+    /// Idempotent. Resolves the spec to a content-hashed session name (so
+    /// system_prompt changes produce a fresh session per MNEME-21) and creates
+    /// the session if it doesn't exist.
+    ///
+    /// The caller's logical `spec.name` is NOT the underlying claudecode
+    /// session name; the actual name includes a content hash. Callers who
+    /// need to fork or chat with the session must call `spec.resolved_name()`
+    /// (or use the helper threaded through ParentSessionSpec).
     async fn ensure_parent_session(&self, spec: ParentSessionSpec) -> Result<(), SwarmError> {
-        // Fast path: already exists.
-        let get_stream = self.claudecode.get(spec.name.clone()).await;
+        let resolved = spec.resolved_name();
+        // Fast path: resolved-name session already exists with current SKILL.md.
+        let get_stream = self.claudecode.get(resolved.clone()).await;
         let mut get_stream = Box::pin(get_stream);
         if let Some(GetResult::Ok { .. }) = get_stream.next().await {
             return Ok(());
         }
-        // Slow path: create.
+        // Slow path: create with the resolved name.
         let model = match spec.model.as_str() {
             "opus" => Model::Opus,
             "sonnet" => Model::Sonnet,
@@ -67,7 +74,7 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
         let create_stream = self
             .claudecode
             .create(
-                spec.name.clone(),
+                resolved.clone(),
                 spec.working_dir.clone(),
                 model,
                 Some(spec.system_prompt),
@@ -80,7 +87,7 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
             Some(CreateResult::Ok { .. }) => Ok(()),
             Some(CreateResult::Err { message }) => {
                 Err(SwarmError::NotImplemented(Box::leak(
-                    format!("create session `{}`: {}", spec.name, message).into_boxed_str(),
+                    format!("create session `{}`: {}", resolved, message).into_boxed_str(),
                 )))
             }
             None => Err(SwarmError::NotImplemented(
@@ -118,7 +125,7 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
             )
             .await
             {
-                Ok(text) => {
+                Ok((text, usage)) => {
                     child_session_ids.push(trial_session_name.clone());
                     let response = parse_response(&text);
                     successes.push(TrialResult {
@@ -126,6 +133,7 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
                         session_id: trial_session_name,
                         response,
                         duration_ms: trial_start.elapsed().as_millis() as u64,
+                        usage,
                     });
                 }
                 Err(error) => {
@@ -139,6 +147,15 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
             }
         }
 
+        // Sum per-trial usage so the trace entry surfaces total tokens / cost
+        // for this swarm fan-out. Trials with `usage == None` (mock runtimes,
+        // claudecode runs with no terminal Complete event) contribute 0.
+        let usage_total = successes
+            .iter()
+            .filter_map(|s| s.usage.clone())
+            .fold(TrialUsage::default(), |acc, u| acc.merge(&u));
+        let trials_with_usage = successes.iter().filter(|s| s.usage.is_some()).count();
+
         // Record the trace entry on the program.
         let entry = TraceEntry::new(
             program.next_seq(),
@@ -147,6 +164,8 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
                 "n": params.n,
                 "parent_session": params.parent_session,
                 "diversify": params.diversify,
+                "usage_total": usage_total,
+                "trials_with_usage": trials_with_usage,
             }),
             child_session_ids,
             if failures.is_empty() { TraceOutcome::Ok } else { TraceOutcome::Err },
@@ -180,7 +199,7 @@ async fn run_one_trial<P: HubContext + 'static>(
     prompt: String,
     timeout: Duration,
     allowed_tools: Option<Vec<String>>,
-) -> Result<String, String> {
+) -> Result<(String, Option<TrialUsage>), String> {
     // Fork.
     let fork_stream = claudecode.fork(parent.clone(), new_name.clone()).await;
     let mut fork_stream = Box::pin(fork_stream);
@@ -205,7 +224,9 @@ async fn run_one_trial<P: HubContext + 'static>(
         while let Some(event) = stream.next().await {
             match event {
                 ChatEvent::Content { text } => buffer.push_str(&text),
-                ChatEvent::Complete { .. } => return Ok(buffer),
+                ChatEvent::Complete { usage, .. } => {
+                    return Ok((buffer, usage.map(chat_usage_to_trial_usage)));
+                }
                 ChatEvent::Err { message } => return Err(format!("chat error: {}", message)),
                 _ => {}
             }
@@ -214,13 +235,22 @@ async fn run_one_trial<P: HubContext + 'static>(
         if buffer.is_empty() {
             Err("chat ended without content".into())
         } else {
-            Ok(buffer)
+            Ok((buffer, None))
         }
     };
 
     match tokio::time::timeout(timeout, chat_future).await {
         Ok(result) => result,
         Err(_) => Err(format!("trial timed out after {:?}", timeout)),
+    }
+}
+
+fn chat_usage_to_trial_usage(u: ChatUsage) -> TrialUsage {
+    TrialUsage {
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        cost_usd: u.cost_usd,
+        num_turns: u.num_turns,
     }
 }
 

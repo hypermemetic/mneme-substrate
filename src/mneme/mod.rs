@@ -17,7 +17,9 @@ pub mod context;
 pub mod program;
 pub mod respond;
 pub mod runtime;
+pub mod storage;
 pub mod swarm;
 
 pub use context::MnemeContext;
 pub use program::{Program, ProgramDirectory, ProgramError, ProgramId, ProgramStatus};
+pub use storage::{MnemeStorage, ProgramRow, SharedStorage, StorageError};

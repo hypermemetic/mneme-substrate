@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde::Serialize;
 
+use super::storage::SharedStorage;
+
 pub mod directory;
 pub mod id;
 pub mod manifest;
@@ -48,6 +50,7 @@ pub struct Program {
     directory: ProgramDirectory,
     manifest: Manifest,
     next_seq: AtomicU32,
+    storage: Option<SharedStorage>,
 }
 
 impl Program {
@@ -67,6 +70,7 @@ impl Program {
             directory,
             manifest,
             next_seq: AtomicU32::new(1),
+            storage: None,
         })
     }
 
@@ -100,6 +104,7 @@ impl Program {
             directory,
             manifest,
             next_seq: AtomicU32::new(1),
+            storage: None,
         })
     }
 
@@ -115,6 +120,12 @@ impl Program {
         self.manifest.depth
     }
 
+    /// Attach a storage handle so close_* methods mirror lifecycle into the
+    /// SQLite index. Without this, the program is filesystem-only.
+    pub fn attach_storage(&mut self, storage: SharedStorage) {
+        self.storage = Some(storage);
+    }
+
     /// Allocate the next monotonic sequence number for a trace entry.
     pub fn next_seq(&self) -> u32 {
         self.next_seq.fetch_add(1, Ordering::SeqCst)
@@ -125,8 +136,11 @@ impl Program {
         Ok(self.directory.append_trace(entry)?)
     }
 
-    /// Close the program as completed; writes the artifact then updates the manifest.
-    pub fn close_completed<T: Serialize>(
+    /// Close the program as completed; writes the artifact then updates the
+    /// manifest. If a storage handle is attached, the SQLite index is updated
+    /// as well (best-effort; logged on failure but not propagated since the
+    /// filesystem is the truth).
+    pub async fn close_completed<T: Serialize>(
         mut self,
         artifact: &T,
         artifact_schema_version: impl Into<String>,
@@ -134,11 +148,19 @@ impl Program {
         self.directory.write_artifact(artifact)?;
         self.manifest.complete(artifact_schema_version);
         self.directory.write_manifest(&self.manifest)?;
+        if let Some(storage) = &self.storage {
+            if let Err(e) = storage
+                .update_status(&self.manifest.program_id, ProgramStatus::Completed)
+                .await
+            {
+                tracing::warn!("storage.update_status(completed) failed: {}", e);
+            }
+        }
         Ok(())
     }
 
     /// Close the program as failed; writes error.json then updates the manifest.
-    pub fn close_failed(
+    pub async fn close_failed(
         mut self,
         kind: &str,
         message: &str,
@@ -147,6 +169,14 @@ impl Program {
         self.directory.write_error(kind, message, stage)?;
         self.manifest.fail();
         self.directory.write_manifest(&self.manifest)?;
+        if let Some(storage) = &self.storage {
+            if let Err(e) = storage
+                .update_status(&self.manifest.program_id, ProgramStatus::Failed)
+                .await
+            {
+                tracing::warn!("storage.update_status(failed) failed: {}", e);
+            }
+        }
         Ok(())
     }
 }
@@ -182,23 +212,23 @@ mod tests {
         assert_eq!(prog.next_seq(), 3);
     }
 
-    #[test]
-    fn close_completed_writes_artifact_and_status() {
+    #[tokio::test]
+    async fn close_completed_writes_artifact_and_status() {
         let root = TempDir::new().unwrap();
         let prog = Program::open(root.path(), "x", json!({}), "v", "v").unwrap();
         let dir = prog.directory().clone();
-        prog.close_completed(&json!({"ok": true}), "0.1.0").unwrap();
+        prog.close_completed(&json!({"ok": true}), "0.1.0").await.unwrap();
         assert!(dir.artifact_path().exists());
         let manifest = dir.read_manifest().unwrap();
         assert_eq!(manifest.status, ProgramStatus::Completed);
     }
 
-    #[test]
-    fn close_failed_writes_error_and_status() {
+    #[tokio::test]
+    async fn close_failed_writes_error_and_status() {
         let root = TempDir::new().unwrap();
         let prog = Program::open(root.path(), "x", json!({}), "v", "v").unwrap();
         let dir = prog.directory().clone();
-        prog.close_failed("Boom", "everything", "trial").unwrap();
+        prog.close_failed("Boom", "everything", "trial").await.unwrap();
         assert!(dir.error_path().exists());
         let manifest = dir.read_manifest().unwrap();
         assert_eq!(manifest.status, ProgramStatus::Failed);

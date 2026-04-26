@@ -1,0 +1,1 @@
+{"seq":1,"at":"2026-04-26T09:26:14.233729Z","op":"swarm_trial","args_summary":{"diversify":"Reasoning style #%i (analytic / contrarian / base-rate-grounded)","n":2,"parent_session":"forecast-parent"},"child_session_ids":["43dc1e42-d4b2-44db-9f4a-836572eaea12-trial-0","43dc1e42-d4b2-44db-9f4a-836572eaea12-trial-1"],"child_program_ids":[],"outcome":"ok","duration_ms":42464}

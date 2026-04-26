@@ -1,0 +1,19 @@
+{
+  "program_id": "43dc1e42-d4b2-44db-9f4a-836572eaea12",
+  "parent_program_id": null,
+  "entry_skill": "forecast.update",
+  "inputs": {
+    "new_evidence": "BTC closed at $95,000 today",
+    "question_program_id": "Q-001",
+    "trials": 2
+  },
+  "inputs_schema_version": "0.1.0",
+  "started_at": "2026-04-26T09:25:31.769037Z",
+  "finished_at": "2026-04-26T09:26:14.234492Z",
+  "status": "completed",
+  "artifact_schema_version": "0.1.0",
+  "substrate_version": "0.6.3",
+  "mneme_version": "0.6.3",
+  "manifest_schema_version": "0.1.0",
+  "depth": 0
+}

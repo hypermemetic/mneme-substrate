@@ -68,6 +68,7 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
                 trial_session_name.clone(),
                 prompt,
                 params.timeout,
+                params.allowed_tools.clone(),
             )
             .await
             {
@@ -132,6 +133,7 @@ async fn run_one_trial<P: HubContext + 'static>(
     new_name: String,
     prompt: String,
     timeout: Duration,
+    allowed_tools: Option<Vec<String>>,
 ) -> Result<String, String> {
     // Fork.
     let fork_stream = claudecode.fork(parent.clone(), new_name.clone()).await;
@@ -144,9 +146,14 @@ async fn run_one_trial<P: HubContext + 'static>(
         None => return Err("fork returned no result".into()),
     }
 
-    // Chat with timeout.
+    // Chat with timeout. Default tools (WebSearch + Read) when caller didn't
+    // specify — so trials can actually research rather than reasoning from
+    // training alone. Caller can pass an explicit list (or empty Vec for none).
+    let allowed_tools = allowed_tools.or_else(|| {
+        Some(vec!["WebSearch".to_string(), "Read".to_string()])
+    });
     let chat_future = async move {
-        let stream = claudecode.chat(new_name, prompt, None, None).await;
+        let stream = claudecode.chat(new_name, prompt, None, allowed_tools).await;
         let mut stream = Box::pin(stream);
         let mut buffer = String::new();
         while let Some(event) = stream.next().await {

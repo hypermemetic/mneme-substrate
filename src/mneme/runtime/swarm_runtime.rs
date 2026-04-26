@@ -73,6 +73,10 @@ pub struct TrialParams {
     pub n: u8,
     pub diversify: Option<String>,
     pub timeout: Duration,
+    /// Tools each trial is allowed to use. None = the runtime's default
+    /// (currently WebSearch + Read). Empty Vec = no tools. Specific list
+    /// = exactly those tools.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 impl TrialParams {
@@ -207,6 +211,7 @@ mod tests {
             n: 0,
             diversify: None,
             timeout: Duration::from_secs(10),
+            allowed_tools: None,
         };
         assert!(matches!(p.validate(), Err(SwarmError::NCap { .. })));
     }
@@ -220,6 +225,7 @@ mod tests {
             n: SWARM_TRIAL_N_CAP + 1,
             diversify: None,
             timeout: Duration::from_secs(10),
+            allowed_tools: None,
         };
         assert!(matches!(p.validate(), Err(SwarmError::NCap { .. })));
     }
@@ -233,6 +239,7 @@ mod tests {
             n: SWARM_TRIAL_N_CAP,
             diversify: None,
             timeout: Duration::from_secs(10),
+            allowed_tools: None,
         };
         p.validate().unwrap();
     }
@@ -262,6 +269,7 @@ mod tests {
             n: 3,
             diversify: None,
             timeout: Duration::from_secs(10),
+            allowed_tools: None,
         };
         let err = stub.trial(&prog, params).await.unwrap_err();
         assert!(matches!(err, SwarmError::NotImplemented(_)));
@@ -284,6 +292,7 @@ mod tests {
             n: 3,
             diversify: None,
             timeout: Duration::from_secs(10),
+            allowed_tools: None,
         };
         let batch = mock.trial(&prog, params).await.unwrap();
         assert_eq!(batch.success_count(), 3);
@@ -307,6 +316,7 @@ mod tests {
             n: 3,
             diversify: None,
             timeout: Duration::from_secs(10),
+            allowed_tools: None,
         };
         let batch = mock.trial(&prog, params).await.unwrap();
         assert_eq!(batch.success_count(), 1);
@@ -374,6 +384,7 @@ mod tests {
             n: 3,
             diversify: Some("Reasoning style #%i (analytic / contrarian / base-rate)".into()),
             timeout: Duration::from_secs(10),
+            allowed_tools: None,
         };
         let batch = mock.trial(&prog, params).await.unwrap();
         assert_eq!(batch.success_count(), 3);
@@ -433,7 +444,7 @@ mod tests {
             "calibration_applied": true,
         });
         let dir_clone = prog.directory().clone();
-        prog.close_completed(&artifact, "0.1.0").unwrap();
+        prog.close_completed(&artifact, "0.1.0").await.unwrap();
 
         // Verify the on-disk state.
         assert!(dir_clone.artifact_path().exists());

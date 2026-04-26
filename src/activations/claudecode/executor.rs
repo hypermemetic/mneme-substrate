@@ -103,6 +103,17 @@ pub struct LaunchConfig {
     pub loopback_enabled: bool,
     /// Session ID for loopback correlation
     pub loopback_session_id: Option<String>,
+    /// Cookies to forward to the spawned `claude` process via env var
+    /// `CLAUDE_PLEXUS_FORWARD_COOKIES_JSON`. The CLI reads this and includes
+    /// the cookies in outbound HTTP requests to the Anthropic API. Used for
+    /// multi-tenant scenarios and for forwarding inbound substrate
+    /// authentication context to upstream services.
+    pub forward_cookies: Option<std::collections::HashMap<String, String>>,
+    /// HTTP headers to forward to the spawned `claude` process via env var
+    /// `CLAUDE_PLEXUS_FORWARD_HEADERS_JSON`. Same purpose as
+    /// `forward_cookies` but for arbitrary headers (Authorization,
+    /// X-Origin, etc.).
+    pub forward_headers: Option<std::collections::HashMap<String, String>>,
 }
 
 impl Default for LaunchConfig {
@@ -121,6 +132,8 @@ impl Default for LaunchConfig {
             max_turns: None,
             loopback_enabled: false,
             loopback_session_id: None,
+            forward_cookies: None,
+            forward_headers: None,
         }
     }
 }
@@ -258,6 +271,8 @@ impl ClaudeCodeExecutor {
         let working_dir = config.working_dir.clone();
         let loopback_enabled = config.loopback_enabled;
         let loopback_session_id = config.loopback_session_id.clone();
+        let forward_cookies = config.forward_cookies.clone();
+        let forward_headers = config.forward_headers.clone();
 
         // Build MCP config - merge loopback config if enabled
         let mcp_config = if loopback_enabled {
@@ -416,6 +431,29 @@ impl ClaudeCodeExecutor {
             if loopback_enabled {
                 if let Some(ref session_id) = loopback_session_id {
                     cmd.env("PLEXUS_SESSION_ID", session_id);
+                }
+            }
+
+            // Forward cookies / headers from the substrate request context
+            // to the spawned claude process. Serialized as JSON env vars so
+            // the CLI can deserialize and include them in upstream HTTP
+            // requests. Empty maps are no-ops (don't pollute env).
+            if let Some(cookies) = &forward_cookies {
+                if !cookies.is_empty() {
+                    if let Ok(json) = serde_json::to_string(cookies) {
+                        cmd.env("CLAUDE_PLEXUS_FORWARD_COOKIES_JSON", json);
+                    } else {
+                        tracing::warn!("failed to serialize forward_cookies; skipping");
+                    }
+                }
+            }
+            if let Some(headers) = &forward_headers {
+                if !headers.is_empty() {
+                    if let Ok(json) = serde_json::to_string(headers) {
+                        cmd.env("CLAUDE_PLEXUS_FORWARD_HEADERS_JSON", json);
+                    } else {
+                        tracing::warn!("failed to serialize forward_headers; skipping");
+                    }
                 }
             }
 

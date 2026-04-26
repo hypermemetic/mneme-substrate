@@ -2,6 +2,7 @@ pub mod activations;
 pub mod builder;
 pub mod mcp_bridge;
 pub mod mcp_session;
+pub mod mneme;
 pub mod plexus;
 pub mod plugin_system;
 pub mod types;

@@ -7,6 +7,10 @@ use std::sync::{Arc, Weak};
 use crate::activations::arbor::{Arbor, ArborConfig};
 use crate::activations::bash::Bash;
 use crate::activations::forecast::Forecast;
+use crate::activations::planning::Planning;
+use crate::activations::security_review::SecurityReview;
+use crate::activations::strong_typing::StrongTyping;
+use crate::activations::ticketing::Ticketing;
 use crate::mneme::context::MnemeContext;
 use crate::mneme::runtime::claudecode_swarm_runtime::ClaudeCodeSwarmRuntime;
 #[cfg(feature = "chaos")]
@@ -150,15 +154,26 @@ pub async fn build_plexus_rpc() -> Arc<DynamicHub> {
         let swarm_runtime = Arc::new(ClaudeCodeSwarmRuntime::new(claudecode_arc));
         let mneme_context = Arc::new(MnemeContext::new("./programs", swarm_runtime));
 
-        // mneme skills wired with the shared context.
+        // mneme skills wired with the shared context. Bodies of all but
+        // forecast still emit "swarm-not-wired" until each pipeline is
+        // fleshed out; registering them now makes them discoverable via
+        // synapse and lets external callers see the typed schemas.
         let forecast = Forecast::new(mneme_context.clone());
+        let ticketing = Ticketing::new(mneme_context.clone());
+        let planning = Planning::new(mneme_context.clone());
+        let security_review = SecurityReview::new(mneme_context.clone());
+        let strong_typing = StrongTyping::new(mneme_context.clone());
 
         // Build and return the DynamicHub with "substrate" namespace
         let hub = DynamicHub::new("substrate")
             .register(Health::new())
             .register(Echo::new())
             .register(Bash::new())
-            .register(forecast);
+            .register(forecast)
+            .register(ticketing)
+            .register(planning)
+            .register(security_review)
+            .register(strong_typing);
 
         // Chaos activation is feature-gated — off by default because it pulls
         // in libc + narrow unsafe signal primitives.

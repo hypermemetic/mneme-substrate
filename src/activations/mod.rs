@@ -60,3 +60,6 @@ pub mod security_review;
 
 // Strong Typing — proposes newtypes for bare identifiers (skeleton)
 pub mod strong_typing;
+
+// Programs — query + inspect program directories
+pub mod programs;

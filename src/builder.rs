@@ -9,6 +9,7 @@ use crate::activations::bash::Bash;
 use crate::activations::forecast::Forecast;
 use crate::activations::planning::Planning;
 use crate::activations::security_review::SecurityReview;
+use crate::activations::programs::Programs;
 use crate::activations::strong_typing::StrongTyping;
 use crate::activations::ticketing::Ticketing;
 use crate::mneme::context::MnemeContext;
@@ -174,6 +175,7 @@ pub async fn build_plexus_rpc() -> Arc<DynamicHub> {
         let planning = Planning::new(mneme_context.clone());
         let security_review = SecurityReview::new(mneme_context.clone());
         let strong_typing = StrongTyping::new(mneme_context.clone());
+        let programs = Programs::new(mneme_context.clone());
 
         // Build and return the DynamicHub with "substrate" namespace
         let hub = DynamicHub::new("substrate")
@@ -184,7 +186,8 @@ pub async fn build_plexus_rpc() -> Arc<DynamicHub> {
             .register(ticketing)
             .register(planning)
             .register(security_review)
-            .register(strong_typing);
+            .register(strong_typing)
+            .register(programs);
 
         // Chaos activation is feature-gated — off by default because it pulls
         // in libc + narrow unsafe signal primitives.

@@ -13,6 +13,7 @@ use crate::activations::strong_typing::StrongTyping;
 use crate::activations::ticketing::Ticketing;
 use crate::mneme::context::MnemeContext;
 use crate::mneme::runtime::claudecode_swarm_runtime::ClaudeCodeSwarmRuntime;
+use crate::mneme::storage::MnemeStorage;
 #[cfg(feature = "chaos")]
 use crate::activations::chaos::Chaos;
 use crate::activations::claudecode::{ClaudeCode, ClaudeCodeStorage, ClaudeCodeStorageConfig};
@@ -119,6 +120,14 @@ pub async fn build_plexus_rpc() -> Arc<DynamicHub> {
         .await
         .expect("Failed to initialize Registry");
 
+    // Initialize the mneme programs SQLite index. The DB lives next to the
+    // substrate's other databases; programs are still primarily on disk.
+    let mneme_storage = Arc::new(
+        MnemeStorage::open("./.substrate/mneme-programs.db".into())
+            .await
+            .expect("Failed to initialize mneme programs storage"),
+    );
+
     // Use Arc::new_cyclic to get a Weak<DynamicHub> during construction
     // This allows us to inject the parent context into Cone and ClaudeCode
     // before the hub is fully constructed, avoiding reference cycles
@@ -152,7 +161,9 @@ pub async fn build_plexus_rpc() -> Arc<DynamicHub> {
         // fork+chat against the same claudecode instance the hub serves.
         let claudecode_arc = Arc::new(claudecode.clone());
         let swarm_runtime = Arc::new(ClaudeCodeSwarmRuntime::new(claudecode_arc));
-        let mneme_context = Arc::new(MnemeContext::new("./programs", swarm_runtime));
+        let mneme_context = Arc::new(
+            MnemeContext::new("./programs", swarm_runtime).with_storage(mneme_storage.clone()),
+        );
 
         // mneme skills wired with the shared context. Bodies of all but
         // forecast still emit "swarm-not-wired" until each pipeline is

@@ -1,0 +1,22 @@
+{
+  "program_id": "1f55f9c2-b8dd-46cc-9603-4c35297be98d",
+  "parent_program_id": null,
+  "entry_skill": "forecast.update",
+  "inputs": {
+    "allowed_tools": [
+      "[\"WebSearch\"]"
+    ],
+    "new_evidence": "It is currently 2026-04-26. BTC closed at $95,000 today. The question is whether BTC will close above $100,000 by 2026-12-31.",
+    "question_program_id": "Q-002",
+    "trials": 2
+  },
+  "inputs_schema_version": "0.1.0",
+  "started_at": "2026-04-26T09:38:23.835527Z",
+  "finished_at": "2026-04-26T09:39:28.213381Z",
+  "status": "completed",
+  "artifact_schema_version": "0.1.0",
+  "substrate_version": "0.6.3",
+  "mneme_version": "0.6.3",
+  "manifest_schema_version": "0.1.0",
+  "depth": 0
+}

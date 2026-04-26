@@ -13,9 +13,11 @@
 //! diagram in the sibling `mneme/` repo's README.
 
 pub mod calibration;
+pub mod context;
 pub mod program;
 pub mod respond;
 pub mod runtime;
 pub mod swarm;
 
+pub use context::MnemeContext;
 pub use program::{Program, ProgramDirectory, ProgramError, ProgramId, ProgramStatus};

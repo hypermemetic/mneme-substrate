@@ -1,0 +1,203 @@
+[package]
+name = "mneme-substrate"
+version = "0.6.3"
+edition = "2021"
+description = "mneme — skill orchestration on Plexus RPC; forked from plexus-substrate"
+license = "AGPL-3.0-only"
+default-run = "mneme-substrate"
+
+[lib]
+name = "mneme_substrate"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mneme-substrate"
+path = "src/main.rs"
+
+[[bin]]
+name = "mcp-gateway"
+path = "src/bin/mcp_gateway.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+tokio = { version = "1.0", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+futures-util = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+thiserror = "1.0"
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+either = "1.9"
+schemars = { version = "1.1", features = ["derive", "uuid1"] }
+axum = { version = "0.7" }
+tower = "0.4"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+uuid = { version = "1.6", features = ["v4", "v5", "serde"] }
+rand = "0.8"
+hostname = "0.3"
+regex = "1.10"
+dirs = "5.0"
+which = "6.0"
+# JSON-RPC server and client dependencies
+jsonrpsee = { version = "0.26", features = ["server", "client", "ws-client", "macros"] }
+clap = { version = "4.0", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "tracing-log"] }
+dotenvy = "0.15"
+tower-http = { version = "0.5", features = ["trace", "util", "cors"] }
+http = "1.0"
+http-body-util = "0.1"
+form_urlencoded = "1.2"  # For parsing query parameters in MCP gateway
+
+# LLM client
+
+# Session types for method protocols
+dialectic = { version = "0.4.1", features = ["tokio"] }
+
+# MCP server via rmcp
+rmcp = { version = "0.12", features = ["server", "transport-io", "transport-streamable-http-server"] }
+cllient = "0.2.1"
+plexus-macros = "0.5"
+plexus-core = "0.5"
+plexus-transport = { version = "0.2", features = ["mcp-gateway"] }
+# plexus-jsexec = "0.1.0"  # temporarily disabled - needs API updates
+registry = { package = "plexus-registry", version = "0.1.0" }
+
+# Mustache templating
+mustache = "0.9"
+
+# POSIX signal primitives (used by chaos activation, gated by the `chaos` feature)
+libc = { version = "0.2", optional = true }
+
+[features]
+default = ["mcp-gateway"]
+mcp-gateway = ["plexus-transport/mcp-gateway"]
+# chaos: opt-in fault-injection activation. Pulls in libc + two narrow
+# unsafe blocks (libc::kill SIGKILL/SIGTERM). Off by default so the
+# baseline library has zero unsafe compiled in.
+chaos = ["dep:libc"]
+
+[dev-dependencies]
+hyper = "1"
+tower = { version = "0.5", features = ["util"] }
+reqwest = { version = "0.11", features = ["json"] }
+jsonrpsee = { version = "0.26", features = ["client", "ws-client"] }
+tokio-tungstenite = "0.21"
+tempfile = "3"
+
+[[example]]
+name = "rmcp_mcp_server"
+path = "examples/rmcp_mcp_server.rs"
+
+# --- Lint posture ---
+#
+# Mirrors HF-CLEAN's posture (hyperforge 4.1.2). Goal: fail the build on any
+# new warning. Every `"allow"` entry must carry a one-line justification.
+
+[lints.rust]
+warnings = "deny"
+# Substrate's DEFAULT library compiles with ZERO unsafe. The two narrow
+# `libc::kill` call sites (POSIX signals, no safe std wrapper) live in the
+# `chaos` activation, which is gated behind the `chaos` feature flag —
+# opt-in, default-off. Those sites carry narrow `#[allow(unsafe_code)]` that
+# only activate when `--features chaos` is set. Upgrade to `"forbid"` only
+# if chaos is extracted to a separate crate; until then, `"deny"` + narrow
+# allows is the compatible posture.
+unsafe_code = "deny"
+# `unused_crate_dependencies` produces structural false positives in multi-
+# target crates (substrate ships a lib + 2 bins + examples; several deps are
+# bin- or example-only). Kept as allow rather than per-target `#[allow]`
+# churn. Revisit if Cargo gains target-specific dependency support.
+unused_crate_dependencies = "allow"
+# `let_underscore_drop` fires on fire-and-forget I/O sites that deliberately
+# ignore Result. Rewriting to `drop(...)` or `.ok()` harms readability without
+# catching real bugs. Kept off (mirrors HF-CLEAN rationale).
+let_underscore_drop = "allow"
+unreachable_pub = "warn"
+# `missing_debug_implementations` fires on internal adapter/activation types
+# that wrap non-Debug foreign values (sqlx pools, jsonrpsee clients, rmcp
+# handles, tokio sinks/streams). Deriving cleanly would require manual impls
+# across the entire activation surface. Scope exceeds this cleanup; tracked
+# as follow-up (mirrors HF-DEBUG rationale).
+missing_debug_implementations = "allow"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Opt-outs: each is noise-to-signal too low to enforce workspace-wide.
+module_name_repetitions = "allow"   # common in domain modules; renaming adds churn without clarity
+missing_errors_doc = "allow"        # opt-in documentation, not correctness
+missing_panics_doc = "allow"        # same
+must_use_candidate = "allow"        # signal-to-noise too low
+too_many_lines = "allow"            # subjective; not enforcing
+# `unused_async` fires on methods kept async to preserve the Plexus method
+# signature shape (all generated by `#[plexus_macros::method]` and must return
+# a Future for dispatch). Churning the signature belongs to plexus-macros, not
+# substrate.
+unused_async = "allow"
+# Activation methods pass params 1:1 with Plexus RPC arguments. Argument-count
+# cleanup belongs to activation-specific reshape tickets, not this lint sweep.
+too_many_arguments = "allow"
+# `struct_excessive_bools` fires on config/event structs with multiple flag
+# fields (e.g. ClaudeCodeConfig, ConeConfig). Restructuring those is an API
+# change, not a warning fix.
+struct_excessive_bools = "allow"
+# `match_same_arms` + `ignored_unit_patterns` flag matches like `Ok(()) => {}`
+# which is the idiomatic Rust pattern for Result<()>. Not a bug.
+match_same_arms = "allow"
+ignored_unit_patterns = "allow"
+# `significant_drop_tightening`, `assigning_clones`, `option_if_let_else`,
+# `or_fun_call`, `redundant_pub_crate`, `use_self`, `needless_pass_by_value`,
+# `ref_option`, `case_sensitive_file_extension_comparisons`, `similar_names`,
+# `cast_possible_truncation`, `cast_precision_loss` — nursery/pedantic lints
+# that fire on code where the current form is idiomatic or the cited risk is
+# a non-issue. Each would take a sweep + benchmark that is out of scope.
+significant_drop_tightening = "allow"
+assigning_clones = "allow"
+option_if_let_else = "allow"
+or_fun_call = "allow"
+redundant_pub_crate = "allow"
+use_self = "allow"
+needless_pass_by_value = "allow"
+ref_option = "allow"
+case_sensitive_file_extension_comparisons = "allow"
+similar_names = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+# `cast_possible_wrap`, `cast_sign_loss`, `cast_lossless` fire on SQLite
+# integer conversions (SQLite stores INTEGER as i64; we round-trip timestamps
+# through `as u64` / `as i64`). Also fires on `libc::kill(pid as i32, ...)`
+# where the POSIX signal ABI is fixed. Values in those call-sites are bounded
+# well within the destination type; enforcing these would add `TryFrom` +
+# explicit error handling with no real correctness benefit.
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+# `unused_self` fires on SQL `row_to_X(&self, row)` converter methods that
+# take `&self` for namespacing (keeping them as impl methods rather than
+# free functions) without using it. Converting them all to free functions
+# is a refactor, not a lint fix.
+unused_self = "allow"
+# `format_push_string` suggests `write!(s, ...)?` replacements that add import
+# and error-handling noise for trivial `String::push_str(&format!(...))`.
+format_push_string = "allow"
+# `return_self_not_must_use` flags every method that returns `Self`, including
+# fluent builder/constructor helpers. Adding `#[must_use]` to each is noise;
+# calling idioms at use sites already capture the value.
+return_self_not_must_use = "allow"
+# `manual_let_else` is stylistic pedantic. Many sites are hub methods that
+# use an early-return `yield Error; return;` pattern that `let ... else`
+# handles poorly.
+manual_let_else = "allow"
+# `used_underscore_binding` fires on wire-facing `_connection: Option<Value>`
+# parameters in `#[plexus_macros::method]` signatures (the `_`-prefix is the
+# Plexus transport convention for injected connection metadata). The macro
+# transforms the fn so per-argument `#[allow]` attrs don't propagate, and the
+# parameter is legitimately read in the body. Rename is not an option — the
+# `_`-prefix is part of the wire contract. Opt out workspace-wide.
+used_underscore_binding = "allow"
+

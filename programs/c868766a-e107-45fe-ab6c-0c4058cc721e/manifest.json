@@ -1,0 +1,22 @@
+{
+  "program_id": "c868766a-e107-45fe-ab6c-0c4058cc721e",
+  "parent_program_id": null,
+  "entry_skill": "forecast.update",
+  "inputs": {
+    "allowed_tools": [
+      "WebSearch"
+    ],
+    "new_evidence": "Today is 2026-04-26. The S&P 500 closed at 5,847 last week. Question: Will the S&P 500 close above 6,000 by end of December 2026?",
+    "question_program_id": "BENCH-K5-001",
+    "trials": 5
+  },
+  "inputs_schema_version": "0.1.0",
+  "started_at": "2026-04-26T10:43:17.459818Z",
+  "finished_at": "2026-04-26T10:48:00.231050Z",
+  "status": "completed",
+  "artifact_schema_version": "0.1.0",
+  "substrate_version": "0.6.3",
+  "mneme_version": "0.6.3",
+  "manifest_schema_version": "0.1.0",
+  "depth": 0
+}

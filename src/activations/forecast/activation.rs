@@ -23,6 +23,23 @@ use crate::mneme::context::MnemeContext;
 use crate::mneme::runtime::swarm_runtime::{ParentSessionSpec, TrialParams};
 use crate::mneme::swarm::aggregate::{aggregate, AggregationRule};
 
+/// Build an empty `ForecastState` for the Started event's `prior` field.
+/// Used when there's no real prior (first call) — the structured fields
+/// stay empty and the schema version is current.
+fn empty_state(probability: f64, confidence: ForecastConfidence) -> ForecastState {
+    ForecastState {
+        probability,
+        confidence,
+        evidence_for: vec![],
+        evidence_against: vec![],
+        open_questions: vec![],
+        summary: String::new(),
+        n_trials: 0,
+        prior_used: None,
+        belief_schema_version: BELIEF_SCHEMA_VERSION.to_string(),
+    }
+}
+
 /// The forecasting skill prompt. Loaded into the parent claudecode session
 /// as the system prompt so each trial reasons inside the BLF framing without
 /// the activation having to repeat it in every prompt.
@@ -213,13 +230,7 @@ impl Forecast {
 
             yield UpdateEvent::Started {
                 program_id: update_program_id,
-                prior: ForecastState {
-                    probability: DEFAULT_PRIOR,
-                    summary: String::new(),
-                    confidence: ForecastConfidence::SinglePass,
-                    n_trials: 0,
-                    prior_used: None,
-                },
+                prior: empty_state(DEFAULT_PRIOR, ForecastConfidence::SinglePass),
             };
         }
     }
@@ -310,13 +321,26 @@ async fn run_update_in_background(
         }
     };
 
-    let summary = match aggregate(&trial_responses, &AggregationRule::ConcatEvidence {
-        field: "summary".into(),
-        separator: "\n\n".into(),
-    }) {
-        Ok(v) => v["aggregated"].as_str().unwrap_or("").to_string(),
-        Err(_) => String::new(),
-    };
+    // Merge structured fields across trials. Each trial may produce
+    // evidence_for / evidence_against / open_questions; we concatenate
+    // (preserving trial order) for evidence and union for open_questions
+    // (de-duplicating exact string matches).
+    let parsed_trials: Vec<TrialResponse> = trial_responses
+        .iter()
+        .filter_map(|v| serde_json::from_value::<TrialResponse>(v.clone()).ok())
+        .collect();
+
+    let mut evidence_for: Vec<EvidenceItem> = vec![];
+    let mut evidence_against: Vec<EvidenceItem> = vec![];
+    let mut open_questions_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for t in &parsed_trials {
+        evidence_for.extend(t.evidence_for.iter().cloned());
+        evidence_against.extend(t.evidence_against.iter().cloned());
+        for q in &t.open_questions {
+            open_questions_set.insert(q.clone());
+        }
+    }
+    let open_questions: Vec<String> = open_questions_set.into_iter().collect();
 
     let probability = logit["aggregated"].as_f64().unwrap_or(DEFAULT_PRIOR);
     let n_trials = batch.success_count() as u8;
@@ -325,15 +349,37 @@ async fn run_update_in_background(
     } else {
         ForecastConfidence::SinglePass
     };
-    let state = ForecastState {
+
+    let mut state = ForecastState {
         probability,
-        summary,
         confidence,
+        evidence_for,
+        evidence_against,
+        open_questions,
+        summary: String::new(),
         n_trials,
         prior_used: None,
+        belief_schema_version: BELIEF_SCHEMA_VERSION.to_string(),
     };
+    // Auto-generate the summary from the structured fields. If trials produced
+    // no structured evidence (legacy v0.1.0 trial output), fall back to
+    // concatenating their prose summaries instead.
+    state.rerender_summary();
+    if state.summary.is_empty() {
+        let legacy_summary = aggregate(
+            &trial_responses,
+            &AggregationRule::ConcatEvidence {
+                field: "summary".into(),
+                separator: "\n\n".into(),
+            },
+        )
+        .ok()
+        .and_then(|v| v["aggregated"].as_str().map(String::from))
+        .unwrap_or_default();
+        state.summary = legacy_summary;
+    }
 
-    if let Err(e) = program.close_completed(&state, "0.1.0").await {
+    if let Err(e) = program.close_completed(&state, BELIEF_SCHEMA_VERSION).await {
         tracing::error!("forecast.update close_completed failed: {}", e);
     }
 }

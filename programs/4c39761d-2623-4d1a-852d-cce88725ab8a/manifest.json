@@ -1,0 +1,22 @@
+{
+  "program_id": "4c39761d-2623-4d1a-852d-cce88725ab8a",
+  "parent_program_id": null,
+  "entry_skill": "forecast.update",
+  "inputs": {
+    "allowed_tools": [
+      "WebSearch"
+    ],
+    "new_evidence": "Context: mneme is a Plexus RPC server implementing the BLF (Bayesian Linguistic Forecaster) framework from Murphy 2026 (arXiv 2604.18576). The paper claims SOTA on ForecastBench, beating GPT-5, Grok 4.20, and Foresight-32B. The paper headline figure shows LOO-shrinkage (leave-one-out) consistently outperforming plain mean across Metaculus Baseline Score, Brier Score, and Brier Index. Our current implementation diverges: we shrink trial probabilities in logit space toward a fixed prior of 0.5 with lambda=0.2 instead of LOO-shrinkage. Question: If we replace fixed-prior shrinkage with LOO-shrinkage as described in the paper, will the mean Brier score on a 50-question sample of ForecastBench improve by more than 0.005? Research the paper if needed.",
+    "question_program_id": "META-001-loo-shrinkage-vs-fixed-prior",
+    "trials": 3
+  },
+  "inputs_schema_version": "0.1.0",
+  "started_at": "2026-04-26T10:14:17.478139Z",
+  "finished_at": "2026-04-26T10:21:47.734885Z",
+  "status": "completed",
+  "artifact_schema_version": "0.1.0",
+  "substrate_version": "0.6.3",
+  "mneme_version": "0.6.3",
+  "manifest_schema_version": "0.1.0",
+  "depth": 0
+}

@@ -7,6 +7,6 @@ mod types;
 
 pub use activation::Forecast;
 pub use types::{
-    CreateEvent, ForecastConfidence, ForecastState, PriorRef, ResolveEvent, TrialResponse,
-    UpdateEvent,
+    CreateEvent, EvidenceItem, ForecastConfidence, ForecastState, PriorRef, ResolveEvent,
+    TrialResponse, UpdateEvent, BELIEF_SCHEMA_VERSION,
 };

@@ -11,17 +11,25 @@
 //!
 //! See the ticketing skill documentation for the contract.
 
+use std::sync::Arc;
+
 use super::types::*;
 use async_stream::stream;
 use futures::Stream;
 
-/// The ticketing activation. Stateless; tickets are written to disk.
-#[derive(Clone, Default)]
-pub struct Ticketing;
+use crate::mneme::context::MnemeContext;
+
+/// The ticketing activation. Holds an [`MnemeContext`] for opening programs
+/// and accessing the orchestration runtime.
+#[derive(Clone)]
+pub struct Ticketing {
+    #[allow(dead_code)]
+    context: Arc<MnemeContext>,
+}
 
 impl Ticketing {
-    pub const fn new() -> Self {
-        Ticketing
+    pub fn new(context: Arc<MnemeContext>) -> Self {
+        Self { context }
     }
 }
 
@@ -76,11 +84,15 @@ impl Ticketing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mneme::context::MnemeContext;
     use futures::StreamExt;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn write_emits_started_then_swarm_not_wired_error() {
-        let ticketing = Ticketing::new();
+        let _dir = TempDir::new().unwrap();
+        let context = Arc::new(MnemeContext::with_stub_swarm(_dir.path()));
+        let ticketing = Ticketing::new(context);
         let stream = ticketing.write(
             "EPIC-1".into(),
             "Implement feature X".into(),

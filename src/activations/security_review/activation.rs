@@ -11,17 +11,25 @@
 //!
 //! See the security-review skill documentation for the contract.
 
+use std::sync::Arc;
+
 use super::types::*;
 use async_stream::stream;
 use futures::Stream;
 
-/// The security_review activation. Stateless; audit reports are written to disk.
-#[derive(Clone, Default)]
-pub struct SecurityReview;
+use crate::mneme::context::MnemeContext;
+
+/// The security_review activation. Holds an [`MnemeContext`] for opening programs
+/// and accessing the orchestration runtime.
+#[derive(Clone)]
+pub struct SecurityReview {
+    #[allow(dead_code)]
+    context: Arc<MnemeContext>,
+}
 
 impl SecurityReview {
-    pub const fn new() -> Self {
-        SecurityReview
+    pub fn new(context: Arc<MnemeContext>) -> Self {
+        Self { context }
     }
 }
 
@@ -76,11 +84,15 @@ impl SecurityReview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mneme::context::MnemeContext;
     use futures::StreamExt;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn audit_emits_started_then_swarm_not_wired_error() {
-        let security_review = SecurityReview::new();
+        let _dir = TempDir::new().unwrap();
+        let context = Arc::new(MnemeContext::with_stub_swarm(_dir.path()));
+        let security_review = SecurityReview::new(context);
         let stream = security_review.audit(
             "/code".into(),
             "OAuth 2.0".into(),

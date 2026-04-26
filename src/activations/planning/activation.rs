@@ -11,17 +11,25 @@
 //!
 //! See the planning skill documentation for the contract.
 
+use std::sync::Arc;
+
 use super::types::*;
 use async_stream::stream;
 use futures::Stream;
 
-/// The planning activation. Stateless; plans are written to disk.
-#[derive(Clone, Default)]
-pub struct Planning;
+use crate::mneme::context::MnemeContext;
+
+/// The planning activation. Holds an [`MnemeContext`] for opening programs
+/// and accessing the orchestration runtime.
+#[derive(Clone)]
+pub struct Planning {
+    #[allow(dead_code)]
+    context: Arc<MnemeContext>,
+}
 
 impl Planning {
-    pub const fn new() -> Self {
-        Planning
+    pub fn new(context: Arc<MnemeContext>) -> Self {
+        Self { context }
     }
 }
 
@@ -75,11 +83,15 @@ impl Planning {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mneme::context::MnemeContext;
     use futures::StreamExt;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn epic_emits_started_then_swarm_not_wired_error() {
-        let planning = Planning::new();
+        let _dir = TempDir::new().unwrap();
+        let context = Arc::new(MnemeContext::with_stub_swarm(_dir.path()));
+        let planning = Planning::new(context);
         let stream = planning.epic(
             "Implement multi-tenant architecture".into(),
             vec!["Must support 1000s of tenants".into()],

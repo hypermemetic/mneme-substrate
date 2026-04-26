@@ -11,17 +11,25 @@
 //!
 //! See the strong-typing skill documentation for the contract.
 
+use std::sync::Arc;
+
 use super::types::*;
 use async_stream::stream;
 use futures::Stream;
 
-/// The strong_typing activation. Stateless; proposals are written to disk.
-#[derive(Clone, Default)]
-pub struct StrongTyping;
+use crate::mneme::context::MnemeContext;
+
+/// The strong_typing activation. Holds an [`MnemeContext`] for opening programs
+/// and accessing the orchestration runtime.
+#[derive(Clone)]
+pub struct StrongTyping {
+    #[allow(dead_code)]
+    context: Arc<MnemeContext>,
+}
 
 impl StrongTyping {
-    pub const fn new() -> Self {
-        StrongTyping
+    pub fn new(context: Arc<MnemeContext>) -> Self {
+        Self { context }
     }
 }
 
@@ -70,11 +78,15 @@ impl StrongTyping {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mneme::context::MnemeContext;
     use futures::StreamExt;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn propose_emits_started_then_swarm_not_wired_error() {
-        let strong_typing = StrongTyping::new();
+        let _dir = TempDir::new().unwrap();
+        let context = Arc::new(MnemeContext::with_stub_swarm(_dir.path()));
+        let strong_typing = StrongTyping::new(context);
         let stream = strong_typing.propose(
             "/code".into(),
             Some(vec!["auth".into(), "billing".into()]),

@@ -310,8 +310,17 @@ async fn run_iterative_trial<P: HubContext + 'static>(
         Some(vec!["WebSearch".to_string(), "Read".to_string()])
     });
 
-    let mut driver =
-        ClaudecodeStepDriver::new(claudecode, new_name.clone(), allowed_tools);
+    // Working dir for the search-worker session. The trial reasoning session
+    // already inherits the parent's working dir via fork(); the search worker
+    // is created fresh and just needs SOMEWHERE to run — /tmp is fine since
+    // it never touches files. Threading the parent's dir through TrialParams
+    // would be cleaner; left as cleanup if it ever matters.
+    let mut driver = ClaudecodeStepDriver::new(
+        claudecode,
+        new_name.clone(),
+        allowed_tools,
+        "/tmp".to_string(),
+    );
 
     let loop_future = async {
         iterative_trial(&mut driver, &initial_question, max_steps).await

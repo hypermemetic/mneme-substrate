@@ -15,8 +15,11 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use plexus_core::plexus::HubContext;
 
-use crate::activations::claudecode::{ChatEvent, ChatUsage, ClaudeCode};
-use crate::activations::forecast::{Observation, StepContext, StepDriver};
+use chrono::Utc;
+use uuid::Uuid;
+
+use crate::activations::claudecode::{ChatEvent, ChatUsage, ClaudeCode, CreateResult, Model};
+use crate::activations::forecast::{Action, Observation, SearchHit, StepContext, StepDriver};
 use crate::mneme::swarm::TrialUsage;
 
 /// Per-step driver bound to one claudecode session.
@@ -24,7 +27,13 @@ pub(crate) struct ClaudecodeStepDriver<P: HubContext + 'static> {
     pub(crate) claudecode: Arc<ClaudeCode<P>>,
     pub(crate) session_name: String,
     pub(crate) allowed_tools: Option<Vec<String>>,
+    pub(crate) working_dir: String,
     pub(crate) usage_accum: TrialUsage,
+    /// Lazily-created sibling session used to execute `WebSearch` /
+    /// `LookupUrl` actions in isolation from the main reasoning session.
+    /// Keeping the search worker separate prevents search-tool clutter
+    /// from polluting the reasoning session's history.
+    search_session: Option<String>,
 }
 
 impl<P: HubContext + 'static> ClaudecodeStepDriver<P> {
@@ -32,12 +41,15 @@ impl<P: HubContext + 'static> ClaudecodeStepDriver<P> {
         claudecode: Arc<ClaudeCode<P>>,
         session_name: String,
         allowed_tools: Option<Vec<String>>,
+        working_dir: String,
     ) -> Self {
         Self {
             claudecode,
             session_name,
             allowed_tools,
+            working_dir,
             usage_accum: TrialUsage::default(),
+            search_session: None,
         }
     }
 
@@ -45,10 +57,182 @@ impl<P: HubContext + 'static> ClaudecodeStepDriver<P> {
     pub(crate) fn into_usage(self) -> TrialUsage {
         self.usage_accum
     }
+
+    /// Lazily create (or return) the search-worker session. Allows
+    /// cross-action reuse so we're not repeatedly paying session-spawn
+    /// costs for back-to-back searches.
+    async fn ensure_search_session(&mut self) -> Result<String, String> {
+        if let Some(name) = &self.search_session {
+            return Ok(name.clone());
+        }
+        let name = format!("search-worker-{}", Uuid::new_v4());
+        let create = self
+            .claudecode
+            .create(
+                name.clone(),
+                self.working_dir.clone(),
+                Model::Sonnet,
+                Some(SEARCH_WORKER_SYSTEM_PROMPT.to_string()),
+                None,
+                None,
+            )
+            .await;
+        let mut create = Box::pin(create);
+        match create.next().await {
+            Some(CreateResult::Ok { .. }) => {
+                self.search_session = Some(name.clone());
+                Ok(name)
+            }
+            Some(CreateResult::Err { message }) => {
+                Err(format!("create search session: {}", message))
+            }
+            None => Err("create search session returned no result".into()),
+        }
+    }
+
+    /// Send a chat to the search worker, drain events, return the assistant
+    /// text. Accumulates usage into the trial's running total.
+    async fn search_chat(&mut self, prompt: String, allowed_tools: Vec<String>) -> Result<String, String> {
+        let session = self.ensure_search_session().await?;
+        let stream = self
+            .claudecode
+            .chat(session, prompt, None, Some(allowed_tools))
+            .await;
+        let mut stream = Box::pin(stream);
+        let mut buffer = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                ChatEvent::Content { text } => buffer.push_str(&text),
+                ChatEvent::Complete { usage, .. } => {
+                    if let Some(u) = usage {
+                        self.usage_accum = self.usage_accum.merge(&chat_usage_to_trial(u));
+                    }
+                    return Ok(buffer);
+                }
+                ChatEvent::Err { message } => {
+                    return Err(format!("search chat error: {}", message));
+                }
+                _ => {}
+            }
+        }
+        if buffer.is_empty() {
+            Err("search chat ended without Complete event".into())
+        } else {
+            Ok(buffer)
+        }
+    }
+}
+
+const SEARCH_WORKER_SYSTEM_PROMPT: &str = "You are a search worker. Your only \
+job is to execute web searches or URL fetches and return raw results as JSON. \
+You never reason, opine, or summarize beyond what was retrieved. You always \
+return a fenced ```json block matching the requested shape.";
+
+impl<P: HubContext + 'static> ClaudecodeStepDriver<P> {
+    /// Run a real WebSearch via the search-worker session, parse the
+    /// response into `SearchHit`s.
+    async fn run_web_search(&mut self, query: &str, k: u8) -> Result<Vec<SearchHit>, String> {
+        let prompt = format!(
+            "Use the WebSearch tool exactly once to search for: {}\n\n\
+             Return up to {} top results as a fenced ```json block whose contents \
+             match this shape EXACTLY:\n\n\
+             ```json\n[\n  {{\"url\": \"https://...\", \"title\": \"...\", \"snippet\": \"...\"}}\n]\n```\n\
+             Only the JSON array — no prose around it.",
+            query, k
+        );
+        let text = self.search_chat(prompt, vec!["WebSearch".to_string()]).await?;
+        let raw = extract_json_block(&text)
+            .ok_or_else(|| "search worker returned no JSON block".to_string())?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("parse search JSON: {}", e))?;
+        let arr = parsed
+            .as_array()
+            .ok_or_else(|| "search JSON is not an array".to_string())?;
+        let mut hits = Vec::with_capacity(arr.len());
+        for (i, item) in arr.iter().enumerate() {
+            let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let title = item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let snippet = item
+                .get("snippet")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            hits.push(SearchHit {
+                id: format!("r{}", i + 1),
+                url,
+                title,
+                snippet,
+                published_at: None,
+            });
+        }
+        Ok(hits)
+    }
+
+    /// Fetch the content of a URL via the search worker (Read or WebFetch tool).
+    async fn run_lookup_url(&mut self, url: &str) -> Result<String, String> {
+        let prompt = format!(
+            "Fetch the content at this URL using the WebFetch tool: {}\n\n\
+             Return the page's main text content as a fenced ```json block:\n\n\
+             ```json\n{{\"content\": \"... the page text ...\"}}\n```\n\
+             Truncate to ~3000 chars if longer. Only the JSON — no prose.",
+            url
+        );
+        let text = self.search_chat(prompt, vec!["WebFetch".to_string()]).await?;
+        let raw = extract_json_block(&text)
+            .ok_or_else(|| "lookup worker returned no JSON block".to_string())?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("parse lookup JSON: {}", e))?;
+        parsed
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "lookup JSON missing `content` field".to_string())
+    }
+}
+
+/// Extract the contents of the LAST fenced ```json block. Mirrors the
+/// helper in `iterative_loop` but kept separate to avoid a cross-module
+/// pub dependency.
+fn extract_json_block(text: &str) -> Option<String> {
+    let marker = "```json";
+    let start = text.rfind(marker)?;
+    let after = &text[start + marker.len()..];
+    let end = after.find("```")?;
+    Some(after[..end].trim().to_string())
 }
 
 #[async_trait]
 impl<P: HubContext + 'static> StepDriver for ClaudecodeStepDriver<P> {
+    async fn execute_action(&mut self, action: Action) -> Observation {
+        match action {
+            Action::Submit { probability } => Observation::Submitted { probability },
+            Action::WebSearch { query, k } => match self.run_web_search(&query, k).await {
+                Ok(results) => Observation::SearchResults { results },
+                Err(message) => Observation::Error { message },
+            },
+            Action::LookupUrl { url } => match self.run_lookup_url(&url).await {
+                Ok(content) => Observation::PageContent {
+                    url,
+                    content,
+                    fetched_at: Utc::now(),
+                },
+                Err(message) => Observation::Error { message },
+            },
+            // SummarizeResults / FetchTimeSeries / FetchWikipediaSection
+            // remain stubbed; BLFX-15 (source tools) covers the rest.
+            other => Observation::Error {
+                message: format!(
+                    "action {:?} not yet implemented in ClaudecodeStepDriver — see BLFX-15",
+                    other
+                ),
+            },
+        }
+    }
+
     async fn next_step(&mut self, ctx: StepContext<'_>) -> Result<String, String> {
         let prompt = build_session_prompt(&ctx);
 

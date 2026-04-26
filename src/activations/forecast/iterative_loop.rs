@@ -20,7 +20,7 @@
 
 use async_trait::async_trait;
 
-use super::agent_loop::{execute_action, parse_step, Action, Observation, ParseError};
+use super::agent_loop::{execute_action as default_execute_action, parse_step, Action, Observation, ParseError};
 use super::types::{ForecastConfidence, TrialResponse};
 
 /// One assistant step the loop executed: what action was taken and what
@@ -56,13 +56,21 @@ pub struct StepContext<'a> {
 }
 
 /// Pluggable per-step driver. Production wires this to a long-running
-/// claudecode session (one chat call per step). Tests dispense canned
-/// responses via [`QueueStepDriver`].
+/// claudecode session (one chat call per step) and a search worker.
+/// Tests dispense canned responses via [`QueueStepDriver`].
 #[async_trait]
 pub trait StepDriver: Send {
     /// Send the next step to the LLM, await the response text. The text is
     /// then passed through [`parse_step`] by the loop.
     async fn next_step(&mut self, ctx: StepContext<'_>) -> Result<String, String>;
+
+    /// Execute the action the LLM picked this step. Default impl returns
+    /// the stub observations from [`super::agent_loop::execute_action`]
+    /// (suitable for mock-only tests). Production drivers override this
+    /// to run real WebSearch / LookupUrl / source-specific fetchers.
+    async fn execute_action(&mut self, action: Action) -> Observation {
+        default_execute_action(action).await
+    }
 }
 
 /// Run the iterative trial loop against `driver`.
@@ -99,7 +107,7 @@ pub async fn iterative_trial<D: StepDriver>(
                 return Ok((belief, history));
             }
             other => {
-                let observation = execute_action(other.clone()).await;
+                let observation = driver.execute_action(other.clone()).await;
                 history.push(HistoryEntry {
                     action: other,
                     observation,

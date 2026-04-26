@@ -1,0 +1,22 @@
+{
+  "program_id": "5740f1fb-8c1b-40ea-b82c-7af3ede70450",
+  "parent_program_id": null,
+  "entry_skill": "forecast.update",
+  "inputs": {
+    "allowed_tools": [
+      "WebSearch"
+    ],
+    "new_evidence": "Today is 2026-04-26. Bitcoin closed at $95,000 last week. Question: Will Bitcoin close above $100,000 by end of December 2026?",
+    "question_program_id": "BENCH-002-K3-structured",
+    "trials": 3
+  },
+  "inputs_schema_version": "0.1.0",
+  "started_at": "2026-04-26T10:51:25.116509Z",
+  "finished_at": null,
+  "status": "running",
+  "artifact_schema_version": null,
+  "substrate_version": "0.6.3",
+  "mneme_version": "0.6.3",
+  "manifest_schema_version": "0.1.0",
+  "depth": 0
+}

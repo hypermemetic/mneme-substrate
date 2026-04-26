@@ -23,7 +23,7 @@ pub const BELIEF_SCHEMA_VERSION: &str = "0.2.0";
 /// (multi-trial vs single-pass) and the model's self-rated certainty
 /// (low/medium/high per the paper). For backwards compatibility we keep the
 /// aggregation senses as variants and add the paper's three levels alongside.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ForecastConfidence {
     /// Aggregate of multiple independent trials.
@@ -142,7 +142,7 @@ impl From<&ForecastState> for PriorRef {
 /// This is the schema demanded by the SKILL.md prompt. Trials produce JSON
 /// matching this shape; the substrate parses it into ForecastState fragments
 /// before aggregation.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct TrialResponse {
     pub probability: f64,
     /// Optional in v0.2.0: trials may produce structured fields and skip

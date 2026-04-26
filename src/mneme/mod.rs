@@ -12,6 +12,7 @@
 //! these modules compose via normal Rust function calls. See the architecture
 //! diagram in the sibling `mneme/` repo's README.
 
+pub mod benchmarks;
 pub mod calibration;
 pub mod context;
 pub mod program;

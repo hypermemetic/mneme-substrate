@@ -1,0 +1,8 @@
+# Don't copy build artifacts or per-run state into the image.
+target/
+programs/
+.cargo/
+.substrate/
+*.log
+.DS_Store
+.git/

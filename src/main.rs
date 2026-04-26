@@ -28,6 +28,12 @@ struct Args {
     /// When neither is provided, no authentication is required.
     #[arg(long, env = "PLEXUS_API_KEY")]
     api_key: Option<String>,
+
+    /// Network address to bind. Default `127.0.0.1` keeps the server
+    /// loopback-only on a host install. Set to `0.0.0.0` when running
+    /// inside a container so the host's port-forward can reach it.
+    #[arg(long, env = "MNEME_BIND", default_value = "127.0.0.1")]
+    bind: String,
 }
 
 
@@ -141,10 +147,10 @@ async fn main() -> anyhow::Result<()> {
                 let hub = hub_route.clone();
                 Box::pin(async move { hub.route(&method, params, None).await })
             });
-            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", args.port).parse()?;
+            let addr: std::net::SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
             tracing::info!("Substrate Plexus RPC server started");
-            tracing::info!("  WebSocket: ws://127.0.0.1:{}", args.port);
-            tracing::info!("  MCP HTTP:  http://127.0.0.1:{}/mcp", args.port);
+            tracing::info!("  WebSocket: ws://{}:{}", args.bind, args.port);
+            tracing::info!("  MCP HTTP:  http://{}:{}/mcp", args.bind, args.port);
             let handle = serve_combined(module, hub, Some(flat_schemas), Some(route_fn), addr, args.api_key, false).await?;
             handle.stopped().await;
             Ok(())

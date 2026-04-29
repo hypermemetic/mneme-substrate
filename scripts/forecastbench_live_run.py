@@ -65,7 +65,8 @@ def join_market(question_set_path: Path, resolution_set_path: Path):
     return joined
 
 
-def fire_forecast(question, port: int, trials: int, run_dir: Path) -> dict:
+def fire_forecast(question, port: int, trials: int, run_dir: Path,
+                  iterative_max_steps: int = 0) -> dict:
     """Fire one forecast.update against the substrate; poll its artifact."""
     new_evidence = (
         f"Question: {question['question']}\n\n"
@@ -80,6 +81,8 @@ def fire_forecast(question, port: int, trials: int, run_dir: Path) -> dict:
         "trials": trials,
         "allowed_tools": ["WebSearch"],
     }
+    if iterative_max_steps and iterative_max_steps > 0:
+        params["iterative_max_steps"] = iterative_max_steps
     cmd = [
         "synapse", "-j", "-P", str(port), "-p", json.dumps(params),
         "substrate", "forecast", "update",
@@ -174,6 +177,8 @@ def main():
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--port", type=int, default=4456)
     ap.add_argument("--trials", type=int, default=2)
+    ap.add_argument("--iterative-max-steps", type=int, default=0,
+                    help="If >0, run trials as iterative BLF loops with up to N steps; default 0 = single-shot")
     ap.add_argument("--output", default=None, help="dir to write results.jsonl + summary.json")
     args = ap.parse_args()
 
@@ -190,7 +195,11 @@ def main():
     results = []
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        futs = {pool.submit(fire_forecast, q, args.port, args.trials, out_dir): q for q in sample}
+        futs = {
+            pool.submit(fire_forecast, q, args.port, args.trials, out_dir,
+                        args.iterative_max_steps): q
+            for q in sample
+        }
         for fut in as_completed(futs):
             r = fut.result()
             results.append(r)

@@ -29,6 +29,7 @@ use crate::mneme::swarm::aggregate::{aggregate, AggregationRule};
 fn empty_state(probability: f64, confidence: ForecastConfidence) -> ForecastState {
     ForecastState {
         probability,
+        raw_probability: None,
         confidence,
         evidence_for: vec![],
         evidence_against: vec![],
@@ -48,7 +49,14 @@ const FORECAST_SKILL_MD: &str = include_str!(
 );
 
 const DEFAULT_TRIALS: u8 = 3;
-const DEFAULT_LAMBDA: f64 = 0.2;
+// Per Murphy 2026 §4, optimal α = 1.0 on ForecastBench (no shrinkage).
+// Our previous λ=0.2 default shrunk every aggregated probability 20%
+// toward 0.5 — wrong direction for confident-but-correct predictions
+// and the largest single algorithmic divergence from the paper that
+// can be fixed in one line. BLFX-5 will replace this with LOO-CV-tuned
+// α once the calibration store has enough resolved observations
+// (MNEME-26 seeded the first 20).
+const DEFAULT_LAMBDA: f64 = 0.0;
 const DEFAULT_PRIOR: f64 = 0.5;
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
@@ -441,7 +449,7 @@ async fn run_update_in_background(
     }
     let open_questions: Vec<String> = open_questions_set.into_iter().collect();
 
-    let probability = logit["aggregated"].as_f64().unwrap_or(DEFAULT_PRIOR);
+    let raw_probability = logit["aggregated"].as_f64().unwrap_or(DEFAULT_PRIOR);
     let n_trials = batch.success_count() as u8;
     let confidence = if n_trials > 1 {
         ForecastConfidence::MultiTrial
@@ -449,8 +457,46 @@ async fn run_update_in_background(
         ForecastConfidence::SinglePass
     };
 
+    // MNEME-28: apply Platt calibration when the calibration store has
+    // fit parameters. Cold-start (None bias) → identity; post-cold-start
+    // (Some bias) → calibrated. raw_probability is always the pre-Platt
+    // aggregate; probability is what consumers should use.
+    let calibration_root = context.programs_root().join("_calibration");
+    let probability = match crate::mneme::calibration::CalibrationStore::open(&calibration_root) {
+        Ok(store) => match store.read_bias() {
+            Ok(Some(params)) => {
+                match crate::mneme::calibration::platt_apply(params, raw_probability) {
+                    Ok(calibrated) => {
+                        tracing::info!(
+                            raw = %format_args!("{:.4}", raw_probability),
+                            calibrated = %format_args!("{:.4}", calibrated),
+                            a = %format_args!("{:.4}", params.a),
+                            b = %format_args!("{:.4}", params.b),
+                            "calibration_applied"
+                        );
+                        calibrated
+                    }
+                    Err(e) => {
+                        tracing::warn!("platt_apply failed, using raw: {}", e);
+                        raw_probability
+                    }
+                }
+            }
+            Ok(None) => raw_probability, // cold-start: identity
+            Err(e) => {
+                tracing::warn!("calibration store read_bias failed, using raw: {}", e);
+                raw_probability
+            }
+        },
+        Err(e) => {
+            tracing::warn!("calibration store open failed, using raw: {}", e);
+            raw_probability
+        }
+    };
+
     let mut state = ForecastState {
         probability,
+        raw_probability: Some(raw_probability),
         confidence,
         evidence_for,
         evidence_against,
@@ -651,6 +697,82 @@ mod tests {
             UpdateEvent::Error { stage, .. } => assert_eq!(stage, "validate"),
             other => panic!("unexpected: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn update_applies_platt_when_calibration_store_has_bias() {
+        // Pre-seed the calibration store at the temp programs_root so
+        // forecast.update reads non-cold-start bias and applies it.
+        use crate::mneme::calibration::{CalibrationStore, ResolvedObservation, COLD_START_THRESHOLD};
+        use chrono::Utc;
+
+        let (dir, forecast) = forecast_with_mock(vec![
+            // Trial responses centered around 0.7 — somewhere away from 0.5
+            // so calibration will visibly move the value.
+            json!({"probability": 0.72, "summary": "trial 0"}),
+            json!({"probability": 0.68, "summary": "trial 1"}),
+        ]);
+        let calibration_root = dir.path().join("_calibration");
+        let store = CalibrationStore::open(&calibration_root).unwrap();
+        // Seed enough observations to cross COLD_START_THRESHOLD with a
+        // pattern that produces a non-identity Platt fit. Mix of correct
+        // and wrong predictions at varied confidence so a≠1, b≠0.
+        for i in 0..(COLD_START_THRESHOLD + 5) {
+            let predicted = if i % 3 == 0 { 0.85 } else { 0.45 };
+            let actual = i % 2 == 0;
+            store
+                .record(&ResolvedObservation {
+                    program_id: format!("seed-{}", i),
+                    predicted,
+                    actual,
+                    deadline: None,
+                    resolved_at: Utc::now(),
+                })
+                .unwrap();
+        }
+        let bias = store.read_bias().unwrap().expect("post-cold-start bias");
+        // Sanity: the seeded data should NOT have produced an identity fit.
+        assert!(
+            (bias.a - 1.0).abs() > 1e-6 || bias.b.abs() > 1e-6,
+            "seeded bias should be non-identity; got a={}, b={}",
+            bias.a,
+            bias.b
+        );
+
+        // Run forecast.update.
+        let stream = forecast
+            .update("Q-PLATT-001".into(), "evidence".into(), Some(2), None, None, None)
+            .await;
+        let mut s = Box::pin(stream);
+        let evt = s.next().await.expect("event");
+        let program_id = match evt {
+            UpdateEvent::Started { program_id, .. } => program_id,
+            other => panic!("unexpected: {:?}", other),
+        };
+
+        // Wait for completion + read the artifact.
+        let _manifest =
+            await_program_status(dir.path(), &program_id, std::time::Duration::from_secs(5)).await;
+        let artifact_bytes =
+            std::fs::read(dir.path().join(&program_id).join("artifact.json")).unwrap();
+        let artifact: Value = serde_json::from_slice(&artifact_bytes).unwrap();
+
+        let calibrated = artifact["probability"].as_f64().unwrap();
+        let raw = artifact["raw_probability"]
+            .as_f64()
+            .expect("raw_probability present in v0.3 artifact");
+        // Calibrated must differ from raw — Platt was applied.
+        assert!(
+            (calibrated - raw).abs() > 1e-6,
+            "calibrated {} should differ from raw {} when bias != identity",
+            calibrated,
+            raw
+        );
+        // Both must be valid probabilities.
+        assert!((0.0..=1.0).contains(&calibrated));
+        assert!((0.0..=1.0).contains(&raw));
+        // Schema version should be 0.3.0.
+        assert_eq!(artifact["belief_schema_version"], "0.3.0");
     }
 
     #[tokio::test]

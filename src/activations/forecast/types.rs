@@ -15,7 +15,13 @@ use serde::{Deserialize, Serialize};
 
 /// Schema version embedded in artifacts written by `forecast.update`.
 /// Bump on breaking changes.
-pub const BELIEF_SCHEMA_VERSION: &str = "0.2.0";
+///
+/// 0.3.0 (MNEME-28): adds `raw_probability` field — the pre-Platt
+///   aggregated value, kept alongside the calibrated `probability` for
+///   forensic comparison. Older artifacts (no field) still parse.
+/// 0.2.0: added `evidence_for / evidence_against / open_questions / confidence`.
+/// 0.1.0: original `{probability, summary}` shape.
+pub const BELIEF_SCHEMA_VERSION: &str = "0.3.0";
 
 /// Confidence tag on a `ForecastState`.
 ///
@@ -57,8 +63,16 @@ pub struct EvidenceItem {
 /// The BLF belief state — paper §3 "Belief state".
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ForecastState {
-    /// Point estimate in [0, 1].
+    /// Calibrated point estimate in [0, 1]. After MNEME-28, this is the
+    /// post-Platt-correction probability when the calibration store has
+    /// fit parameters; otherwise equal to `raw_probability`.
     pub probability: f64,
+    /// Pre-calibration aggregated probability — what the trials produced
+    /// before Platt was applied. Kept alongside `probability` for
+    /// forensic comparison and so consumers can re-calibrate against a
+    /// later-fit Platt model. None on artifacts written before 0.3.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_probability: Option<f64>,
     /// Model's self-rated confidence in this estimate.
     pub confidence: ForecastConfidence,
     /// Claims supporting the predicted outcome.
@@ -228,6 +242,7 @@ mod tests {
     fn structured_state() -> ForecastState {
         ForecastState {
             probability: 0.42,
+            raw_probability: Some(0.42),
             confidence: ForecastConfidence::Medium,
             evidence_for: vec![ev("X is happening", 0.7), ev("market signal positive", 0.5)],
             evidence_against: vec![ev("macro headwind", 0.6)],
@@ -300,6 +315,7 @@ mod tests {
     fn render_summary_completely_empty() {
         let s = ForecastState {
             probability: 0.5,
+            raw_probability: None,
             confidence: ForecastConfidence::SinglePass,
             evidence_for: vec![],
             evidence_against: vec![],

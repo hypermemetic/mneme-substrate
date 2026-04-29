@@ -59,6 +59,11 @@ const DEFAULT_TRIALS: u8 = 3;
 const DEFAULT_LAMBDA: f64 = 0.0;
 const DEFAULT_PRIOR: f64 = 0.5;
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
+// BLFX-18: iterative loop default. Paired n=94 result showed mneme+iterative
+// at BI 84 vs crowd 57 (Δ +26.61 BI, 95% CI excludes 0). Murphy 2026 uses
+// T_max=10; we default to 5 because cost scales linearly and the marginal
+// gain from steps 6-10 is unmeasured in our setup.
+const DEFAULT_ITERATIVE_MAX_STEPS: u8 = 5;
 
 /// The forecast activation. Holds an [`MnemeContext`] for opening programs
 /// and accessing the orchestration runtime.
@@ -385,9 +390,16 @@ async fn run_update_in_background(
         "required": ["probability", "summary"]
     });
 
-    // Treat Some(0) as "single-shot" (None) so callers can pass 0 to opt out
-    // explicitly without juggling Option semantics over the wire.
-    let iterative = iterative_max_steps.filter(|t| *t > 0);
+    // Default to iterative T_max=5 per BLFX-18 result (paired n=94: BI 84
+    // vs crowd 57, delta +26.61 BI with 95% CI [-0.1047, -0.0284] excluding
+    // 0 — iterative wins decisively at p<0.05).
+    // Treat Some(0) as explicit opt-out (single-shot) so callers can revert
+    // without juggling Option semantics over the wire.
+    let iterative = match iterative_max_steps {
+        None => Some(DEFAULT_ITERATIVE_MAX_STEPS),
+        Some(0) => None,
+        Some(t) => Some(t),
+    };
 
     let params = TrialParams {
         parent_session,

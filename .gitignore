@@ -51,6 +51,13 @@ logs/
 # `mneme/plans/BLFX/results/`.
 programs/
 
+# Bind-mounted substrate state — claudecode session DBs, arbor conversation
+# trees, cone DBs, lattice graphs, orcha sessions, pm tickets, calibration.
+# The directory is the persistence boundary for the containerized substrate.
+# Don't commit (large + per-machine + sensitive: contains conversation
+# transcripts).
+.plexus-state/
+
 # TLA+ model checker artifacts
 plans/tla2tools.jar
 plans/states/

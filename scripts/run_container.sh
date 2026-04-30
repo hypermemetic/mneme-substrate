@@ -76,10 +76,20 @@ case "$cmd" in
     # sees what the container writes.
     mkdir -p "$(pwd)/programs"
     echo "programs: bind-mounting $(pwd)/programs to /workspace/programs"
+
+    # CRITICAL: bind-mount the substrate's per-activation state directory
+    # so arbor, claudecode, cone, lattice, orcha, pm DBs (and everything
+    # else) survive container restarts. Without this, every `up` (which
+    # does `docker rm -f`) wipes all conversation history, the calibration
+    # store fits, etc. The full conversation log lives under arbor/ here.
+    mkdir -p "$(pwd)/.plexus-state"
+    echo "plexus state: bind-mounting $(pwd)/.plexus-state to /root/.plexus"
+
     docker run "$@" \
       --name "$CONTAINER_NAME" \
       -p "$HOST_PORT:4456" \
       -v "$(pwd)/programs:/workspace/programs" \
+      -v "$(pwd)/.plexus-state:/root/.plexus" \
       "${auth_args[@]}" \
       "$IMAGE_NAME"
     ;;

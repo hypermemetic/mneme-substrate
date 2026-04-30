@@ -47,7 +47,14 @@ pub enum ForecastConfidence {
 /// One piece of evidence the model identified, either supporting (`evidence_for`)
 /// or contradicting (`evidence_against`) the predicted outcome. Mirrors the
 /// paper's structured belief state fields.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+///
+/// Lenient deserialization: accepts either the full object form
+/// `{"claim": "...", "source": "...", "weight": 0.7}` OR a bare string,
+/// which is normalized to `{claim: <string>, source: None, weight: 0.5}`.
+/// Five of bench-005's six failures were the model emitting evidence as
+/// bare strings; the lenient parser eliminates that failure mode without
+/// dropping useful data.
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
 pub struct EvidenceItem {
     /// One-sentence claim summarizing the evidence.
     pub claim: String,
@@ -58,6 +65,46 @@ pub struct EvidenceItem {
     /// Model's self-rated weight of this evidence in [0, 1].
     /// Higher = more impactful on the probability estimate.
     pub weight: f64,
+}
+
+impl<'de> Deserialize<'de> for EvidenceItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Helper {
+            Bare(String),
+            Full {
+                claim: String,
+                #[serde(default)]
+                source: Option<String>,
+                #[serde(default = "default_evidence_weight")]
+                weight: f64,
+            },
+        }
+        match Helper::deserialize(deserializer)? {
+            Helper::Bare(claim) => Ok(EvidenceItem {
+                claim,
+                source: None,
+                weight: default_evidence_weight(),
+            }),
+            Helper::Full {
+                claim,
+                source,
+                weight,
+            } => Ok(EvidenceItem {
+                claim,
+                source,
+                weight,
+            }),
+        }
+    }
+}
+
+fn default_evidence_weight() -> f64 {
+    0.5
 }
 
 /// The BLF belief state — paper §3 "Belief state".
@@ -237,6 +284,48 @@ mod tests {
             source: None,
             weight,
         }
+    }
+
+    #[test]
+    fn evidence_item_accepts_bare_string() {
+        // bench-005 failure pattern: model emitted evidence as a bare string
+        // instead of an object. Lenient parser must accept and normalize.
+        let s = r#""Market price frozen at 0.02""#;
+        let item: EvidenceItem = serde_json::from_str(s).unwrap();
+        assert_eq!(item.claim, "Market price frozen at 0.02");
+        assert!(item.source.is_none());
+        assert_eq!(item.weight, 0.5);
+    }
+
+    #[test]
+    fn evidence_item_accepts_full_object() {
+        let s = r#"{"claim": "X happened", "source": "url", "weight": 0.8}"#;
+        let item: EvidenceItem = serde_json::from_str(s).unwrap();
+        assert_eq!(item.claim, "X happened");
+        assert_eq!(item.source.as_deref(), Some("url"));
+        assert_eq!(item.weight, 0.8);
+    }
+
+    #[test]
+    fn evidence_item_accepts_object_missing_weight() {
+        let s = r#"{"claim": "X happened"}"#;
+        let item: EvidenceItem = serde_json::from_str(s).unwrap();
+        assert_eq!(item.claim, "X happened");
+        assert_eq!(item.weight, 0.5);
+    }
+
+    #[test]
+    fn evidence_list_mixed_string_and_object() {
+        // Realistic failure shape from bench-005: model mixed forms.
+        let s = r#"[
+            {"claim": "structured one", "weight": 0.7},
+            "bare string two",
+            {"claim": "structured three", "source": "url", "weight": 0.6}
+        ]"#;
+        let items: Vec<EvidenceItem> = serde_json::from_str(s).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1].claim, "bare string two");
+        assert_eq!(items[1].weight, 0.5);
     }
 
     fn structured_state() -> ForecastState {

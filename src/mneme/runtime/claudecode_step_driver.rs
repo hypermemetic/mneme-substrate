@@ -19,7 +19,10 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::activations::claudecode::{ChatEvent, ChatUsage, ClaudeCode, CreateResult, Model};
-use crate::activations::forecast::{Action, Observation, ParseError, SearchHit, StepContext, StepDriver};
+use crate::activations::forecast::{
+    apply_search_query_date_filter, is_url_blocked, Action, EnvContext, Observation, ParseError,
+    SearchHit, StepContext, StepDriver,
+};
 use crate::mneme::capabilities::CapabilityRegistry;
 use crate::mneme::swarm::TrialUsage;
 
@@ -39,6 +42,10 @@ pub(crate) struct ClaudecodeStepDriver<P: HubContext + 'static> {
     /// Keeping the search worker separate prevents search-tool clutter
     /// from polluting the reasoning session's history.
     search_session: Option<String>,
+    /// BLFX-9 date-leakage defenses. Default = no enforcement (production
+    /// forecasting); ForecastBench / held-out runs construct this with a
+    /// non-None `cutoff_date` and per-question `blocked_urls`.
+    pub(crate) env: EnvContext,
 }
 
 impl<P: HubContext + 'static> ClaudecodeStepDriver<P> {
@@ -48,6 +55,22 @@ impl<P: HubContext + 'static> ClaudecodeStepDriver<P> {
         allowed_tools: Option<Vec<String>>,
         working_dir: String,
     ) -> Self {
+        Self::new_with_env(
+            claudecode,
+            session_name,
+            allowed_tools,
+            working_dir,
+            EnvContext::default(),
+        )
+    }
+
+    pub(crate) fn new_with_env(
+        claudecode: Arc<ClaudeCode<P>>,
+        session_name: String,
+        allowed_tools: Option<Vec<String>>,
+        working_dir: String,
+        env: EnvContext,
+    ) -> Self {
         Self {
             claudecode,
             session_name,
@@ -56,6 +79,7 @@ impl<P: HubContext + 'static> ClaudecodeStepDriver<P> {
             usage_accum: TrialUsage::default(),
             capabilities: CapabilityRegistry::default_substrate(),
             search_session: None,
+            env,
         }
     }
 
@@ -161,13 +185,15 @@ impl<P: HubContext + 'static> ClaudecodeStepDriver<P> {
     /// Run a real WebSearch via the search-worker session, parse the
     /// response into `SearchHit`s.
     async fn run_web_search(&mut self, query: &str, k: u8) -> Result<Vec<SearchHit>, String> {
+        // BLFX-9 layer 1: substrate-level date filter on the search query.
+        let filtered_query = apply_search_query_date_filter(query, self.env.cutoff_date);
         let prompt = format!(
             "Use the WebSearch tool exactly once to search for: {}\n\n\
              Return up to {} top results as a fenced ```json block whose contents \
              match this shape EXACTLY:\n\n\
              ```json\n[\n  {{\"url\": \"https://...\", \"title\": \"...\", \"snippet\": \"...\"}}\n]\n```\n\
              Only the JSON array — no prose around it.",
-            query, k
+            filtered_query, k
         );
         let text = self.search_chat(prompt, vec!["WebSearch".to_string()]).await?;
         let raw = extract_json_block(&text)
@@ -180,6 +206,12 @@ impl<P: HubContext + 'static> ClaudecodeStepDriver<P> {
         let mut hits = Vec::with_capacity(arr.len());
         for (i, item) in arr.iter().enumerate() {
             let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // BLFX-9 layer 4: drop blocked URLs from search results before
+            // they ever reach the reasoning model.
+            if is_url_blocked(&url, &self.env.blocked_urls) {
+                tracing::debug!(url = %url, "BLFX-9: dropping search hit on blocklist");
+                continue;
+            }
             let title = item
                 .get("title")
                 .and_then(|v| v.as_str())
@@ -190,19 +222,39 @@ impl<P: HubContext + 'static> ClaudecodeStepDriver<P> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            hits.push(SearchHit {
+            let hit = SearchHit {
                 id: format!("r{}", i + 1),
                 url,
                 title,
                 snippet,
                 published_at: None,
-            });
+            };
+            // BLFX-9 layer 2: per-hit LLM leak classifier. Classifier
+            // call only runs if a cutoff is set AND a classifier is
+            // configured (production has neither; benches set both).
+            if let (Some(cutoff), Some(classifier)) =
+                (self.env.cutoff_date, self.env.leak_classifier.as_ref())
+            {
+                if classifier.classify(&hit, cutoff).await {
+                    tracing::debug!(url = %hit.url, "BLFX-9: dropping hit flagged as leaked");
+                    continue;
+                }
+            }
+            hits.push(hit);
         }
         Ok(hits)
     }
 
     /// Fetch the content of a URL via the search worker (Read or WebFetch tool).
     async fn run_lookup_url(&mut self, url: &str) -> Result<String, String> {
+        // BLFX-9 layer 4: refuse to fetch blocked URLs. Substrate-level
+        // enforcement, not "we asked the LLM nicely."
+        if is_url_blocked(url, &self.env.blocked_urls) {
+            return Err(format!(
+                "BLFX-9: URL `{}` is on the per-question blocklist; refusing fetch",
+                url
+            ));
+        }
         let prompt = format!(
             "Fetch the content at this URL using the WebFetch tool: {}\n\n\
              Return the page's main text content as a fenced ```json block:\n\n\

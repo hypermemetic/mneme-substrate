@@ -30,11 +30,92 @@
 //! for the final response — same shape, just nested. If BLFX-S02 finds
 //! native tool-use is meaningfully better, swapping the parser is local.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::types::TrialResponse;
+
+/// Per-trial environment context — the date-leakage defenses (BLFX-9).
+///
+/// `cutoff_date` is the question's freeze date; the substrate enforces
+/// that no information after this date leaks into the trial. When `None`
+/// (production forecasting), all layers are no-ops and behavior matches
+/// pre-BLFX-9. Constructed by `forecast.update` from the caller's
+/// optional `cutoff_date` param and threaded through to the step driver.
+///
+/// Layer mapping:
+/// 1. **Search engine date filtering** — [`apply_search_query_date_filter`]
+///    appends a `before:YYYY-MM-DD` clause to outbound web search queries.
+/// 2. **LLM-based leak classifier** — when [`leak_classifier`] is `Some`,
+///    every search hit is run through it; flagged hits are dropped.
+/// 3. **Data tool date clamping** — `FetchTimeSeries` /
+///    `FetchWikipediaSection` arms read `cutoff_date` and truncate to
+///    that point. (Stubbed actions today; gated through this struct
+///    when implemented.)
+/// 4. **URL blocking** — [`is_url_blocked`] checks each `LookupUrl`
+///    target and each search hit against `blocked_urls`.
+#[derive(Clone, Default)]
+pub struct EnvContext {
+    pub cutoff_date: Option<DateTime<Utc>>,
+    pub blocked_urls: Vec<String>,
+    pub leak_classifier: Option<Arc<dyn LeakClassifier>>,
+}
+
+impl std::fmt::Debug for EnvContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvContext")
+            .field("cutoff_date", &self.cutoff_date)
+            .field("blocked_urls", &self.blocked_urls)
+            .field(
+                "leak_classifier",
+                &self.leak_classifier.as_ref().map(|_| "<dyn LeakClassifier>"),
+            )
+            .finish()
+    }
+}
+
+/// Layer 2: post-fetch classifier that decides whether a search hit is
+/// likely to contain post-cutoff information. `true` = leaked, drop it.
+///
+/// Production impl: a Haiku-class LLM call with a tight prompt that sees
+/// the hit's url/title/snippet/published_at + the cutoff date. Stubbed
+/// at the trait level here; implementations live alongside the
+/// capability registry.
+#[async_trait]
+pub trait LeakClassifier: Send + Sync {
+    async fn classify(&self, hit: &SearchHit, cutoff: DateTime<Utc>) -> bool;
+}
+
+/// Layer 1: append `before:YYYY-MM-DD` to a web-search query when a
+/// cutoff is set. If no cutoff, returns the query unchanged. The
+/// `before:` operator is recognized by Google and Bing; on engines that
+/// don't honor it, layer 2's classifier picks up the slack.
+pub fn apply_search_query_date_filter(query: &str, cutoff: Option<DateTime<Utc>>) -> String {
+    match cutoff {
+        None => query.to_string(),
+        Some(c) => {
+            let suffix = format!("before:{}", c.format("%Y-%m-%d"));
+            // Idempotent: don't double-append if caller already did it.
+            if query.contains("before:") {
+                query.to_string()
+            } else {
+                format!("{} {}", query.trim(), suffix)
+            }
+        }
+    }
+}
+
+/// Layer 4: substring-match a URL against the per-question blocklist.
+/// `blocklist` entries are matched as substrings so callers can pass
+/// either full URLs or domain prefixes (e.g. `polymarket.com/market/...`
+/// blocks every variant of that page).
+pub fn is_url_blocked(url: &str, blocklist: &[String]) -> bool {
+    blocklist.iter().any(|b| !b.is_empty() && url.contains(b.as_str()))
+}
 
 /// One action the LLM picks per step.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -407,5 +488,72 @@ mod tests {
         })
         .await;
         assert!(matches!(obs, Observation::Error { .. }));
+    }
+
+    // BLFX-9 layer-1 tests: date-filter on search queries.
+
+    #[test]
+    fn date_filter_no_cutoff_returns_query_unchanged() {
+        assert_eq!(
+            apply_search_query_date_filter("BTC price", None),
+            "BTC price"
+        );
+    }
+
+    #[test]
+    fn date_filter_appends_before_clause() {
+        let cutoff = DateTime::parse_from_rfc3339("2026-03-15T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let q = apply_search_query_date_filter("BTC price", Some(cutoff));
+        assert_eq!(q, "BTC price before:2026-03-15");
+    }
+
+    #[test]
+    fn date_filter_idempotent_when_already_present() {
+        let cutoff = DateTime::parse_from_rfc3339("2026-03-15T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let q = apply_search_query_date_filter("BTC price before:2026-01-01", Some(cutoff));
+        // Caller's existing before: clause wins — we don't override it.
+        assert_eq!(q, "BTC price before:2026-01-01");
+    }
+
+    // BLFX-9 layer-4 tests: URL blocklist.
+
+    #[test]
+    fn url_blocklist_empty_blocks_nothing() {
+        assert!(!is_url_blocked("https://example.com/page", &[]));
+    }
+
+    #[test]
+    fn url_blocklist_blocks_substring_match() {
+        let blocklist = vec!["polymarket.com/market/will-x-happen".to_string()];
+        assert!(is_url_blocked(
+            "https://polymarket.com/market/will-x-happen",
+            &blocklist
+        ));
+        assert!(is_url_blocked(
+            "https://www.polymarket.com/market/will-x-happen?utm=foo",
+            &blocklist
+        ));
+    }
+
+    #[test]
+    fn url_blocklist_passes_unrelated_urls() {
+        let blocklist = vec!["polymarket.com/market/will-x".to_string()];
+        assert!(!is_url_blocked("https://example.com/news", &blocklist));
+        assert!(!is_url_blocked(
+            "https://polymarket.com/market/will-y",
+            &blocklist
+        ));
+    }
+
+    #[test]
+    fn url_blocklist_ignores_empty_entries() {
+        // An empty string in the blocklist must NOT match every URL —
+        // that would bricks all lookups when callers pass a sloppy list.
+        let blocklist = vec!["".to_string()];
+        assert!(!is_url_blocked("https://example.com", &blocklist));
     }
 }

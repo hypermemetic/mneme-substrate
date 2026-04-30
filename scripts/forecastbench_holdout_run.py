@@ -33,6 +33,7 @@ import json
 import math
 import os
 import random
+import re
 import statistics
 import subprocess
 import sys
@@ -124,8 +125,22 @@ def join_market(question_set_path: Path, resolution_set_paths,
     return joined
 
 
+URL_RE = re.compile(r"https?://[^\s\)\],]+")
+
+
+def derive_blocked_urls(question) -> list:
+    """BLFX-9 layer 4: extract URLs from resolution_criteria as the
+    per-question blocklist. The resolution criteria typically points
+    directly at the page that *is* the answer (the polymarket market,
+    the wikipedia article, etc.) — those are exactly the URLs the
+    iterative loop must not be allowed to fetch on a backtest."""
+    text = question.get("resolution_criteria", "") or ""
+    return list(set(URL_RE.findall(text)))
+
+
 def fire_forecast(question, port: int, trials: int, run_dir: Path,
-                  iterative_max_steps: int = 0) -> dict:
+                  iterative_max_steps: int = 0,
+                  cutoff_date: str = None) -> dict:
     """Fire one forecast.update against the substrate; poll its artifact."""
     new_evidence = (
         f"Question: {question['question']}\n\n"
@@ -142,6 +157,11 @@ def fire_forecast(question, port: int, trials: int, run_dir: Path,
     }
     if iterative_max_steps and iterative_max_steps > 0:
         params["iterative_max_steps"] = iterative_max_steps
+    if cutoff_date:
+        params["cutoff_date"] = cutoff_date
+        blocked = derive_blocked_urls(question)
+        if blocked:
+            params["blocked_urls"] = blocked
     cmd = [
         "synapse", "-j", "-P", str(port), "-p", json.dumps(params),
         "substrate", "forecast", "update",
@@ -259,6 +279,11 @@ def main():
     ap.add_argument("--output", default=None)
     ap.add_argument("--wallclock-cap-seconds", type=int, default=5400,
                     help="Hard cap on bench wall-clock; partial results written if exceeded")
+    ap.add_argument("--cutoff-date", default=None,
+                    help="BLFX-9 freeze-date enforcement: ISO 8601 (e.g. 2026-03-15T00:00:00Z). "
+                         "When set, every forecast is fired with cutoff_date so the substrate "
+                         "applies layer-1 search filtering and layer-4 URL blocklist (the "
+                         "resolution-URL is auto-extracted from the question's resolution_criteria).")
     args = ap.parse_args()
 
     if args.output:
@@ -290,6 +315,7 @@ def main():
             "trials": args.trials,
             "iterative_max_steps": args.iterative_max_steps,
             "port": args.port,
+            "cutoff_date": args.cutoff_date,
         }, indent=2))
 
     if len(sample) < 10:
@@ -305,7 +331,7 @@ def main():
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futs = {
             pool.submit(fire_forecast, q, args.port, args.trials, out_dir,
-                        args.iterative_max_steps): q
+                        args.iterative_max_steps, args.cutoff_date): q
             for q in sample
         }
         for fut in as_completed(futs):

@@ -9,8 +9,8 @@ mod types;
 
 pub use activation::Forecast;
 pub use agent_loop::{
-    execute_action, parse_step, Action, Observation, ParseError, ParsedStep, SearchHit,
-    TimeSeriesPoint,
+    apply_search_query_date_filter, execute_action, is_url_blocked, parse_step, Action,
+    EnvContext, LeakClassifier, Observation, ParseError, ParsedStep, SearchHit, TimeSeriesPoint,
 };
 pub use iterative_loop::{
     build_step_prompt, iterative_trial, HistoryEntry, LoopError, QueueStepDriver, StepContext,

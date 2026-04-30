@@ -81,6 +81,11 @@ pub struct TrialParams {
     /// `t_max` steps (Murphy 2026 Algorithm 1). If `None`, run each trial as
     /// a single chat call (legacy / regression-comparison mode).
     pub iterative_max_steps: Option<u8>,
+    /// BLFX-9: per-trial environment context — date-leakage defenses.
+    /// `None` (production forecasting) means all four layers are no-ops.
+    /// ForecastBench / held-out runs construct this with the question's
+    /// freeze date and per-question URL blocklist.
+    pub env: Option<crate::activations::forecast::EnvContext>,
 }
 
 impl TrialParams {
@@ -256,6 +261,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             allowed_tools: None,
             iterative_max_steps: None,
+            env: None,
         };
         assert!(matches!(p.validate(), Err(SwarmError::NCap { .. })));
     }
@@ -271,6 +277,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             allowed_tools: None,
             iterative_max_steps: None,
+            env: None,
         };
         assert!(matches!(p.validate(), Err(SwarmError::NCap { .. })));
     }
@@ -286,6 +293,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             allowed_tools: None,
             iterative_max_steps: None,
+            env: None,
         };
         p.validate().unwrap();
     }
@@ -317,6 +325,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             allowed_tools: None,
             iterative_max_steps: None,
+            env: None,
         };
         let err = stub.trial(&prog, params).await.unwrap_err();
         assert!(matches!(err, SwarmError::NotImplemented(_)));
@@ -341,6 +350,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             allowed_tools: None,
             iterative_max_steps: None,
+            env: None,
         };
         let batch = mock.trial(&prog, params).await.unwrap();
         assert_eq!(batch.success_count(), 3);
@@ -366,6 +376,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             allowed_tools: None,
             iterative_max_steps: None,
+            env: None,
         };
         let batch = mock.trial(&prog, params).await.unwrap();
         assert_eq!(batch.success_count(), 1);
@@ -435,6 +446,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             allowed_tools: None,
             iterative_max_steps: None,
+            env: None,
         };
         let batch = mock.trial(&prog, params).await.unwrap();
         assert_eq!(batch.success_count(), 3);

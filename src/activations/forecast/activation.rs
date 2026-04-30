@@ -23,6 +23,32 @@ use crate::mneme::context::MnemeContext;
 use crate::mneme::runtime::swarm_runtime::{ParentSessionSpec, TrialParams};
 use crate::mneme::swarm::aggregate::{aggregate, AggregationRule};
 
+/// Parse the optional BLFX-9 inputs (`cutoff_date`, `blocked_urls`) into
+/// an `EnvContext`. Returns `Ok(None)` when neither defense is requested
+/// (production forecasting) so the caller passes through unchanged.
+fn build_env_context(
+    cutoff_date: Option<String>,
+    blocked_urls: Option<Vec<String>>,
+) -> Result<Option<crate::activations::forecast::EnvContext>, String> {
+    let cutoff = match cutoff_date.as_deref() {
+        None | Some("") => None,
+        Some(s) => Some(
+            DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| format!("could not parse cutoff_date `{}`: {}", s, e))?,
+        ),
+    };
+    let blocked = blocked_urls.unwrap_or_default();
+    if cutoff.is_none() && blocked.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(crate::activations::forecast::EnvContext {
+        cutoff_date: cutoff,
+        blocked_urls: blocked,
+        leak_classifier: None,
+    }))
+}
+
 /// Build an empty `ForecastState` for the Started event's `prior` field.
 /// Used when there's no real prior (first call) — the structured fields
 /// stay empty and the schema version is current.
@@ -168,7 +194,9 @@ impl Forecast {
         trials = "Number of trials for this update (1..=16, defaults to 3)",
         parent_session = "Optional parent claudecode session name; defaults to 'forecast-parent'",
         allowed_tools = "Optional list of tools to allow per trial (e.g. [\"WebSearch\", \"Read\"]); None uses the runtime default",
-        iterative_max_steps = "If Some, run each trial as an iterative BLF loop with up to N steps (Murphy 2026 Algorithm 1). If None or 0, run as a single chat call (legacy mode). Default None."
+        iterative_max_steps = "If Some, run each trial as an iterative BLF loop with up to N steps (Murphy 2026 Algorithm 1). If None or 0, run as a single chat call (legacy mode). Default None.",
+        cutoff_date = "BLFX-9 date-leakage defense: ISO 8601 freeze date. When set, every web search query is filtered with `before:YYYY-MM-DD` and the per-question URL blocklist is enforced. None (production) leaves all defenses inert.",
+        blocked_urls = "BLFX-9 layer 4: URLs that are forbidden for this question (e.g. the prediction market's resolution page). Substring match — full URL or domain prefix both work."
     ))]
     async fn update(
         &self,
@@ -178,6 +206,8 @@ impl Forecast {
         parent_session: Option<String>,
         allowed_tools: Option<Vec<String>>,
         iterative_max_steps: Option<u8>,
+        cutoff_date: Option<String>,
+        blocked_urls: Option<Vec<String>>,
     ) -> impl Stream<Item = UpdateEvent> + Send + 'static {
         let context = self.context.clone();
         stream! {
@@ -235,6 +265,21 @@ impl Forecast {
                 return;
             }
 
+            // BLFX-9: build EnvContext from caller-provided cutoff_date /
+            // blocked_urls. Bad cutoff_date string aborts the update with
+            // a clear error rather than silently disabling the defense.
+            let env = match build_env_context(cutoff_date, blocked_urls) {
+                Ok(env) => env,
+                Err(message) => {
+                    let _ = program.close_failed("InvalidCutoff", &message, "build_env_context").await;
+                    yield UpdateEvent::Error {
+                        stage: "validate".into(),
+                        message,
+                    };
+                    return;
+                }
+            };
+
             // Spawn the actual work in the background. The stream returns
             // immediately after yielding Started; the background task drives
             // the trial fan-out + aggregation + program close.
@@ -248,6 +293,7 @@ impl Forecast {
                 resolved_parent,
                 allowed_tools,
                 iterative_max_steps,
+                env,
             ));
 
             yield UpdateEvent::Started {
@@ -376,6 +422,7 @@ async fn run_update_in_background(
     parent_session: String,
     allowed_tools: Option<Vec<String>>,
     iterative_max_steps: Option<u8>,
+    env: Option<crate::activations::forecast::EnvContext>,
 ) {
     let prompt = format!(
         "Forecast update for question program {}.\n\nNew evidence:\n{}\n\nReturn a JSON object with fields `probability` (a number in [0,1]) and `summary` (a one-paragraph evidence summary).",
@@ -410,6 +457,7 @@ async fn run_update_in_background(
         timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         allowed_tools,
         iterative_max_steps: iterative,
+        env,
     };
 
     let batch = match context.swarm().trial(&program, params).await {
@@ -665,7 +713,7 @@ mod tests {
             json!({"probability": 0.7, "summary": "trial 2"}),
         ]);
         let stream = forecast
-            .update("Q-001".into(), "evidence".into(), Some(2), None, None, None)
+            .update("Q-001".into(), "evidence".into(), Some(2), None, None, None, None, None)
             .await;
         let mut s = Box::pin(stream);
         let evt = s.next().await.expect("event");
@@ -685,7 +733,7 @@ mod tests {
     async fn update_with_stub_runtime_closes_program_as_failed() {
         let (dir, forecast) = forecast_with_stub();
         let stream = forecast
-            .update("Q-001".into(), "evidence".into(), None, None, None, None)
+            .update("Q-001".into(), "evidence".into(), None, None, None, None, None, None)
             .await;
         let mut s = Box::pin(stream);
         let evt = s.next().await.expect("event");
@@ -701,7 +749,7 @@ mod tests {
     async fn update_validation_error_does_not_open_program() {
         let (_dir, forecast) = forecast_with_stub();
         let stream = forecast
-            .update("Q-001".into(), "evidence".into(), Some(99), None, None, None)
+            .update("Q-001".into(), "evidence".into(), Some(99), None, None, None, None, None)
             .await;
         let mut s = Box::pin(stream);
         let evt = s.next().await.expect("event");
@@ -753,7 +801,7 @@ mod tests {
 
         // Run forecast.update.
         let stream = forecast
-            .update("Q-PLATT-001".into(), "evidence".into(), Some(2), None, None, None)
+            .update("Q-PLATT-001".into(), "evidence".into(), Some(2), None, None, None, None, None)
             .await;
         let mut s = Box::pin(stream);
         let evt = s.next().await.expect("event");
@@ -808,7 +856,7 @@ mod tests {
             json!({"probability": 0.55, "summary": "trial 1"}),
         ]);
         let stream = forecast
-            .update("Q-RESOLVE-001".into(), "evidence".into(), Some(2), None, None, None)
+            .update("Q-RESOLVE-001".into(), "evidence".into(), Some(2), None, None, None, None, None)
             .await;
         let mut s = Box::pin(stream);
         let evt = s.next().await.expect("update started");

@@ -14,6 +14,7 @@
 
 pub mod benchmarks;
 pub mod calibration;
+pub mod capabilities;
 pub mod context;
 pub mod program;
 pub mod respond;

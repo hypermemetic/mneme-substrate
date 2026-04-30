@@ -19,7 +19,8 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::activations::claudecode::{ChatEvent, ChatUsage, ClaudeCode, CreateResult, Model};
-use crate::activations::forecast::{Action, Observation, SearchHit, StepContext, StepDriver};
+use crate::activations::forecast::{Action, Observation, ParseError, SearchHit, StepContext, StepDriver};
+use crate::mneme::capabilities::CapabilityRegistry;
 use crate::mneme::swarm::TrialUsage;
 
 /// Per-step driver bound to one claudecode session.
@@ -29,6 +30,10 @@ pub(crate) struct ClaudecodeStepDriver<P: HubContext + 'static> {
     pub(crate) allowed_tools: Option<Vec<String>>,
     pub(crate) working_dir: String,
     pub(crate) usage_accum: TrialUsage,
+    /// Capability registry. The driver consults this for the
+    /// `json_cleanup` capability when `parse_step` fails on the agent's
+    /// output (MNEME-29).
+    pub(crate) capabilities: CapabilityRegistry,
     /// Lazily-created sibling session used to execute `WebSearch` /
     /// `LookupUrl` actions in isolation from the main reasoning session.
     /// Keeping the search worker separate prevents search-tool clutter
@@ -49,6 +54,7 @@ impl<P: HubContext + 'static> ClaudecodeStepDriver<P> {
             allowed_tools,
             working_dir,
             usage_accum: TrialUsage::default(),
+            capabilities: CapabilityRegistry::default_substrate(),
             search_session: None,
         }
     }
@@ -127,6 +133,29 @@ const SEARCH_WORKER_SYSTEM_PROMPT: &str = "You are a search worker. Your only \
 job is to execute web searches or URL fetches and return raw results as JSON. \
 You never reason, opine, or summarize beyond what was retrieved. You always \
 return a fenced ```json block matching the requested shape.";
+
+/// Schema description used by the json_cleanup capability when a parse_step
+/// fails. Mirrors `ITERATIVE_FORMAT_CONTRACT` above but worded as a schema
+/// for a cleanup-only model (Haiku) rather than as a contract for the
+/// reasoning agent.
+const ITERATIVE_STEP_SCHEMA_DESCRIPTION: &str = r#"{
+  "action": {
+    "type": "web_search" | "lookup_url" | "summarize_results"
+            | "fetch_time_series" | "fetch_wikipedia_section" | "submit",
+    // Plus type-specific required fields:
+    //   web_search:    "query" (string), "k" (int 1..20)
+    //   lookup_url:    "url" (https://... string)
+    //   summarize_results: "result_ids" (non-empty list of strings)
+    //   submit:        "probability" (float 0..1)
+  },
+  "belief": {
+    "probability": float in [0, 1],          // required
+    "summary": string,                        // required, may be ""
+    "evidence_for": [{"claim": string, "weight": float}, ...] | [string, ...],
+    "evidence_against": [{"claim": string, "weight": float}, ...] | [string, ...],
+    "open_questions": [string, ...]
+  }
+}"#;
 
 impl<P: HubContext + 'static> ClaudecodeStepDriver<P> {
     /// Run a real WebSearch via the search-worker session, parse the
@@ -207,6 +236,36 @@ fn extract_json_block(text: &str) -> Option<String> {
 
 #[async_trait]
 impl<P: HubContext + 'static> StepDriver for ClaudecodeStepDriver<P> {
+    async fn recover_parse(&mut self, raw: &str, err: &ParseError) -> Option<String> {
+        let prompt = format!(
+            "The following text was supposed to be JSON matching the iterative \
+             forecast step contract:\n\n{}\n\n\
+             The parser returned this error:\n  {}\n\n\
+             Output ONLY the corrected JSON object — no prose, no markdown fence, \
+             no apology, no explanation. If you must wrap it in a fence, use \
+             ```json ... ``` so the parser can find it. If the structure is \
+             genuinely unrecoverable, output an empty fence with `{{}}`.\n\n\
+             ---\n\n{}",
+            ITERATIVE_STEP_SCHEMA_DESCRIPTION, err, raw
+        );
+        match self
+            .capabilities
+            .invoke(
+                self.claudecode.clone(),
+                "json_cleanup",
+                prompt,
+                self.working_dir.clone(),
+            )
+            .await
+        {
+            Ok(cleaned) => Some(cleaned),
+            Err(e) => {
+                tracing::warn!("json_cleanup capability failed: {}", e);
+                None
+            }
+        }
+    }
+
     async fn execute_action(&mut self, action: Action) -> Observation {
         match action {
             Action::Submit { probability } => Observation::Submitted { probability },

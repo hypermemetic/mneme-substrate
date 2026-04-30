@@ -71,6 +71,21 @@ pub trait StepDriver: Send {
     async fn execute_action(&mut self, action: Action) -> Observation {
         default_execute_action(action).await
     }
+
+    /// Attempt to recover from a parse failure by routing the raw text
+    /// through a JSON-cleanup capability. Returns `Some(cleaned_text)` if
+    /// the driver tried recovery (caller re-parses the cleaned text);
+    /// returns `None` if the driver doesn't support recovery, in which
+    /// case the parse failure aborts the trial.
+    ///
+    /// Default impl: no recovery. Production driver overrides this to
+    /// invoke `json_cleanup` from the capability registry. Per MNEME-29,
+    /// the loop only invokes this for recoverable [`ParseError`] variants —
+    /// not [`ParseError::NoStepBlock`], which means the model didn't even
+    /// emit a fence and cleanup can't fix that.
+    async fn recover_parse(&mut self, _raw: &str, _err: &ParseError) -> Option<String> {
+        None
+    }
 }
 
 /// Run the iterative trial loop against `driver`.
@@ -94,10 +109,45 @@ pub async fn iterative_trial<D: StepDriver>(
             history: &history,
         };
         let raw = driver.next_step(ctx).await.map_err(LoopError::Driver)?;
-        let parsed = parse_step(&raw).map_err(|source| LoopError::Parse {
-            step: step_idx,
-            source,
-        })?;
+        let parsed = match parse_step(&raw) {
+            Ok(p) => p,
+            Err(err) => {
+                // NoStepBlock means the agent didn't emit a json fence at
+                // all — JSON cleanup can't recover from that. For any
+                // other ParseError, give the driver a chance to clean up
+                // the raw text and re-parse. One retry max; if cleanup
+                // doesn't fix it, propagate the original error.
+                if matches!(err, ParseError::NoStepBlock) {
+                    return Err(LoopError::Parse {
+                        step: step_idx,
+                        source: err,
+                    });
+                }
+                match driver.recover_parse(&raw, &err).await {
+                    Some(cleaned) => match parse_step(&cleaned) {
+                        Ok(p) => {
+                            tracing::info!(
+                                step = step_idx,
+                                "parse_step recovered via json_cleanup capability"
+                            );
+                            p
+                        }
+                        Err(_) => {
+                            return Err(LoopError::Parse {
+                                step: step_idx,
+                                source: err,
+                            });
+                        }
+                    },
+                    None => {
+                        return Err(LoopError::Parse {
+                            step: step_idx,
+                            source: err,
+                        });
+                    }
+                }
+            }
+        };
         last_belief = Some(parsed.belief.clone());
 
         match parsed.action {
@@ -276,6 +326,109 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, LoopError::Driver(_)));
+    }
+
+    /// Test driver that simulates the MNEME-29 recovery path:
+    /// `next_step` first emits malformed JSON (triggering parse failure);
+    /// `recover_parse` returns a clean version that re-parses successfully.
+    /// The loop should silently recover and continue.
+    struct RecoveringStepDriver {
+        responses: std::collections::VecDeque<String>,
+        cleanup_responses: std::collections::VecDeque<String>,
+        recover_calls: usize,
+    }
+
+    #[async_trait]
+    impl StepDriver for RecoveringStepDriver {
+        async fn next_step(&mut self, _ctx: StepContext<'_>) -> Result<String, String> {
+            self.responses
+                .pop_front()
+                .ok_or_else(|| "queue exhausted".to_string())
+        }
+
+        async fn recover_parse(&mut self, _raw: &str, _err: &ParseError) -> Option<String> {
+            self.recover_calls += 1;
+            self.cleanup_responses.pop_front()
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_error_recovers_via_cleanup_capability() {
+        // Simulates the bench-005/006 failure mode: model emits something
+        // that parses as a JSON object but with invalid action type.
+        // Cleanup capability returns a clean step.
+        let bad = "```json\n{\"action\": \"submit\", \"belief\": {\"probability\": 0.7}}\n```";
+        let cleaned = step_block(
+            json!({"type": "submit", "probability": 0.62}),
+            belief_with(0.6, "recovered"),
+        );
+        let mut driver = RecoveringStepDriver {
+            responses: vec![bad.to_string()].into(),
+            cleanup_responses: vec![cleaned].into(),
+            recover_calls: 0,
+        };
+        let (belief, history) = iterative_trial(&mut driver, "Will X?", 5)
+            .await
+            .unwrap();
+        assert_eq!(driver.recover_calls, 1, "cleanup should have been invoked once");
+        assert!((belief.probability - 0.62).abs() < 1e-9);
+        assert!(history.is_empty()); // submit at step 0 → no history entries
+    }
+
+    #[tokio::test]
+    async fn parse_error_propagates_when_cleanup_also_fails() {
+        // Cleanup returns garbage too — original error should propagate.
+        let bad = "```json\n{\"action\": \"submit\", \"belief\": {\"probability\": 0.7}}\n```";
+        let still_bad = "```json\n{\"action\": \"still bad\"}\n```";
+        let mut driver = RecoveringStepDriver {
+            responses: vec![bad.to_string()].into(),
+            cleanup_responses: vec![still_bad.to_string()].into(),
+            recover_calls: 0,
+        };
+        let err = iterative_trial(&mut driver, "Will X?", 5)
+            .await
+            .unwrap_err();
+        assert_eq!(driver.recover_calls, 1);
+        assert!(matches!(err, LoopError::Parse { .. }));
+    }
+
+    #[tokio::test]
+    async fn parse_error_propagates_when_driver_declines_recovery() {
+        // Driver returns None from recover_parse — original error propagates.
+        let bad = "```json\n{\"action\": \"submit\", \"belief\": {\"probability\": 0.7}}\n```";
+        let mut driver = RecoveringStepDriver {
+            responses: vec![bad.to_string()].into(),
+            cleanup_responses: vec![].into(), // pop_front returns None
+            recover_calls: 0,
+        };
+        let err = iterative_trial(&mut driver, "Will X?", 5)
+            .await
+            .unwrap_err();
+        assert_eq!(driver.recover_calls, 1);
+        assert!(matches!(err, LoopError::Parse { .. }));
+    }
+
+    #[tokio::test]
+    async fn no_step_block_skips_recovery_attempt() {
+        // NoStepBlock means the model didn't emit a fence at all —
+        // cleanup can't recover from that. Verify recover_parse is not
+        // even called.
+        let mut driver = RecoveringStepDriver {
+            responses: vec!["just prose, no json fence".to_string()].into(),
+            cleanup_responses: vec![].into(),
+            recover_calls: 0,
+        };
+        let err = iterative_trial(&mut driver, "Will X?", 5)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            driver.recover_calls, 0,
+            "recover_parse should NOT be called for NoStepBlock"
+        );
+        match err {
+            LoopError::Parse { source, .. } => assert_eq!(source, ParseError::NoStepBlock),
+            other => panic!("unexpected: {:?}", other),
+        }
     }
 
     #[tokio::test]

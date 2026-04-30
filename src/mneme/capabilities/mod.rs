@@ -20,6 +20,7 @@
 //! | `reasoning_strong` | Opus | Premium | future BLFX-14 final-step commitment |
 //! | `json_cleanup` | Haiku | Cheap | recover malformed JSON output |
 //! | `summarize_short` | Haiku | Cheap | future search-worker summarization |
+//! | `leak_classifier` | Haiku | Cheap | BLFX-9 layer 2 — drop search hits that look post-cutoff |
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -113,6 +114,12 @@ impl CapabilityRegistry {
             model: Model::Haiku,
             cost_tier: CostTier::Cheap,
             max_tokens: 1024,
+        });
+        r.register(Capability {
+            name: "leak_classifier".to_string(),
+            model: Model::Haiku,
+            cost_tier: CostTier::Cheap,
+            max_tokens: 32, // single-token YES/NO answer; ample headroom
         });
         r
     }
@@ -219,6 +226,14 @@ mod tests {
         let cap = r.get("reasoning_strong").unwrap();
         assert_eq!(cap.model, Model::Opus);
         assert_eq!(cap.cost_tier, CostTier::Premium);
+    }
+
+    #[test]
+    fn leak_classifier_uses_haiku() {
+        let r = CapabilityRegistry::default_substrate();
+        let cap = r.get("leak_classifier").unwrap();
+        assert_eq!(cap.model, Model::Haiku);
+        assert_eq!(cap.cost_tier, CostTier::Cheap);
     }
 
     #[test]

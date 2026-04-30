@@ -69,15 +69,30 @@ impl<P: HubContext + 'static> ClaudecodeStepDriver<P> {
         session_name: String,
         allowed_tools: Option<Vec<String>>,
         working_dir: String,
-        env: EnvContext,
+        mut env: EnvContext,
     ) -> Self {
+        let capabilities = CapabilityRegistry::default_substrate();
+        // BLFX-9 layer 2: auto-attach the default Haiku-backed leak
+        // classifier when a cutoff is set but the operator didn't
+        // supply a classifier. ForecastBench / held-out runs always
+        // fall through this path; production forecasting (no cutoff)
+        // still pays nothing.
+        if env.cutoff_date.is_some() && env.leak_classifier.is_none() {
+            env.leak_classifier = Some(std::sync::Arc::new(
+                crate::mneme::runtime::haiku_leak_classifier::HaikuLeakClassifier::new(
+                    capabilities.clone(),
+                    claudecode.clone(),
+                    working_dir.clone(),
+                ),
+            ));
+        }
         Self {
             claudecode,
             session_name,
             allowed_tools,
             working_dir,
             usage_accum: TrialUsage::default(),
-            capabilities: CapabilityRegistry::default_substrate(),
+            capabilities,
             search_session: None,
             env,
         }

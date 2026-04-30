@@ -58,3 +58,4 @@ plans/*.bin
 
 # Generated code
 generated/
+scripts/__pycache__/

@@ -2,7 +2,7 @@
 name = "mneme-substrate"
 version = "0.6.3"
 edition = "2021"
-description = "mneme — skill orchestration on Plexus RPC; forked from plexus-substrate"
+description = "mneme — Bayesian Linguistic Forecaster (BLF, Murphy 2026, arXiv:2604.18576) on Plexus RPC. Calibrated probabilities + structured rationale + recursive design-as-forecast. https://arxiv.org/abs/2604.18576"
 license = "AGPL-3.0-only"
 default-run = "mneme-substrate"
 

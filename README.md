@@ -234,6 +234,15 @@ cargo build --release --bin mneme-substrate  # release binary
 
 **Forecast hangs >10 min** — typically a metaculus question with a complex resolution criterion the model gets stuck on. Check `programs/<id>/sessions/` and the substrate logs (`docker logs mneme | tail -200`). The lenient EvidenceItem parser + JSON-cleanup recovery (per MNEME-29) eliminates ~95% of parse-failure-driven aborts since v0.1.
 
+**Bench/probe failing with `AuthExpired` (MNEME-37)** — the OAuth token forwarded into the container has expired. Refresh on the host:
+
+```bash
+claude /login                              # interactive — refreshes Keychain entry
+bash scripts/run_container.sh up -d        # bounce the container so it re-reads
+```
+
+The substrate now detects auth-expiry strings in chat responses and tags failures as `AuthExpired` instead of letting them masquerade as `AllTrialsFailed` parse errors. Operator scripts (`forecastbench_submit.py`) abort fast on the first `AuthExpired` rather than burning capacity on guaranteed-fail retries.
+
 **Why did the substrate predict X?** — single command walks the full audit trail (manifest → artifact → trace → per-step (action, observation, belief) for each trial → chat turns) into one readable tree:
 
 ```bash

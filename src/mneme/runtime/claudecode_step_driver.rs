@@ -380,6 +380,13 @@ impl<P: HubContext + 'static> StepDriver for ClaudecodeStepDriver<P> {
                     if let Some(u) = usage {
                         self.usage_accum = self.usage_accum.merge(&chat_usage_to_trial(u));
                     }
+                    // MNEME-37: detect infra-error fingerprints in the
+                    // buffered content before returning it as model output.
+                    if let Some((class, message)) =
+                        crate::mneme::runtime::infra_error::detect_infra_error(&buffer)
+                    {
+                        return Err(format!("{}: {}", class.as_str(), message));
+                    }
                     return Ok(buffer);
                 }
                 ChatEvent::Err { message } => {
@@ -389,7 +396,14 @@ impl<P: HubContext + 'static> StepDriver for ClaudecodeStepDriver<P> {
             }
         }
         if buffer.is_empty() {
-            Err("chat ended without Complete event".into())
+            Err(format!(
+                "{}: chat ended without Complete event",
+                crate::mneme::runtime::infra_error::InfraErrorClass::Empty.as_str()
+            ))
+        } else if let Some((class, message)) =
+            crate::mneme::runtime::infra_error::detect_infra_error(&buffer)
+        {
+            Err(format!("{}: {}", class.as_str(), message))
         } else {
             Ok(buffer)
         }

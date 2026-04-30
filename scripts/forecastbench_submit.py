@@ -288,6 +288,7 @@ def main():
     deadline = t0 + args.wallclock_cap_seconds
     capped = False
     consec_429 = 0
+    aborted_infra = None
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool, \
          results_path.open("a") as results_f:
         futs = {pool.submit(fire_or_reuse, q, args.port, args.trials,
@@ -300,9 +301,22 @@ def main():
             results_f.flush()
             if "error" in r:
                 msg = r["error"][:80]
-                # Crude 429 detection — if we see "429" or "rate" or "limit"
-                # several times in a row, back off.
-                if any(s in r["error"].lower() for s in ("429", "rate limit", "rate_limit")):
+                err_lower = r["error"].lower()
+                # MNEME-37: substrate now tags infra errors explicitly
+                # via the InfraErrorClass detection in run_one_trial /
+                # ClaudecodeStepDriver. Check for AuthExpired and bail
+                # immediately — retrying is futile and costs subscription
+                # capacity.
+                if "authexpired" in err_lower or "invalid authentication" in err_lower:
+                    aborted_infra = "AuthExpired"
+                    print(f"\n!! ABORT: substrate forecast hit AuthExpired.", flush=True)
+                    print(f"   Probable cause: OAuth token expired in container.", flush=True)
+                    print(f"   Fix on host: `claude /login`, then `bash scripts/run_container.sh up -d`.", flush=True)
+                    print(f"   Last error: {r['error'][:200]}", flush=True)
+                    for f in futs:
+                        f.cancel()
+                    break
+                if "ratelimited" in err_lower or any(s in err_lower for s in ("429", "rate limit", "rate_limit")):
                     consec_429 += 1
                 else:
                     consec_429 = 0
@@ -360,6 +374,10 @@ def main():
         print(f"             (FRI requires ≥95% for leaderboard scoring)")
     print(f"\n  results:    {results_path}")
     print(f"  submission: {submission_path}")
+
+    if aborted_infra:
+        print(f"\nEXIT: aborted with {aborted_infra} (non-zero)")
+        sys.exit(2)
 
 
 if __name__ == "__main__":

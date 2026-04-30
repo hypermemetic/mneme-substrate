@@ -32,6 +32,7 @@
 pub mod claudecode_step_driver;
 pub mod claudecode_swarm_runtime;
 pub mod haiku_leak_classifier;
+pub mod infra_error;
 pub mod program_runtime;
 pub mod session_attribution;
 pub mod swarm_runtime;

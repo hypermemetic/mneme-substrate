@@ -292,7 +292,20 @@ async fn run_one_trial<P: HubContext + 'static>(
     };
 
     match tokio::time::timeout(timeout, chat_future).await {
-        Ok(result) => result,
+        Ok(Ok((buffer, usage))) => {
+            // MNEME-37: detect known infra-error fingerprints (auth /
+            // rate-limit / service) BEFORE returning the buffer as if
+            // it were valid model output. Without this, downstream
+            // parse_step blames the model with `NoStepBlock` for what
+            // is actually an OAuth or 429 problem.
+            if let Some((class, message)) =
+                crate::mneme::runtime::infra_error::detect_infra_error(&buffer)
+            {
+                return Err(format!("{}: {}", class.as_str(), message));
+            }
+            Ok((buffer, usage))
+        }
+        Ok(Err(e)) => Err(e),
         Err(_) => Err(format!("trial timed out after {:?}", timeout)),
     }
 }

@@ -107,6 +107,132 @@ impl Programs {
         }
     }
 
+    /// Block until a fire-and-return program reaches a terminal state,
+    /// streaming `Progress` on each status change and ending with
+    /// `Completed { artifact }` / `Failed { error }` / `TimedOut` /
+    /// `NotFound`.
+    ///
+    /// Designed for shell-piping after `forecast.update` (which itself
+    /// is fire-and-return):
+    ///
+    /// ```bash
+    /// PID=$(synapse forecast update --program-id X --new-evidence "..." \
+    ///       | jq -r 'select(.content.type == "started") | .content.program_id')
+    /// synapse programs wait --program-id "$PID"
+    /// ```
+    #[plexus_macros::method(streaming, params(
+        program_id = "Program id (UUID)",
+        poll_interval_ms = "How often to check status; default 2000",
+        timeout_secs = "Hard cap before TimedOut; default 900 (15 min)"
+    ))]
+    async fn wait(
+        &self,
+        program_id: String,
+        poll_interval_ms: Option<u64>,
+        timeout_secs: Option<u64>,
+    ) -> impl Stream<Item = WaitEvent> + Send + 'static {
+        let context = self.context.clone();
+        stream! {
+            let pid = match parse_program_id(&program_id) {
+                Ok(p) => p,
+                Err(_) => {
+                    yield WaitEvent::NotFound { program_id };
+                    return;
+                }
+            };
+            let dir = crate::mneme::program::ProgramDirectory::open(
+                context.programs_root(),
+                pid,
+            );
+            let manifest_path = dir.manifest_path();
+            let artifact_path = dir.artifact_path();
+            let error_path = dir.error_path();
+
+            let poll_ms = poll_interval_ms.unwrap_or(2000).max(100);
+            let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(900));
+            let started_at = std::time::Instant::now();
+            let mut last_status: Option<String> = None;
+
+            loop {
+                let waited_ms = started_at.elapsed().as_millis() as u64;
+
+                if !manifest_path.exists() {
+                    // First poll: program directory not (yet) created.
+                    // Return NotFound rather than spinning until timeout.
+                    if last_status.is_none() {
+                        yield WaitEvent::NotFound { program_id };
+                        return;
+                    }
+                    // Subsequent: shouldn't happen since manifest is written
+                    // before the substrate yields Started, but treat as
+                    // timeout-equivalent.
+                    yield WaitEvent::TimedOut {
+                        program_id,
+                        last_status: last_status.unwrap_or_else(|| "unknown".into()),
+                        waited_ms,
+                    };
+                    return;
+                }
+
+                let manifest_status = std::fs::read(&manifest_path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                // Emit Progress on initial poll OR on status change.
+                let changed = last_status.as_deref() != Some(manifest_status.as_str());
+                if changed {
+                    yield WaitEvent::Progress {
+                        program_id: program_id.clone(),
+                        status: manifest_status.clone(),
+                        age_ms: waited_ms,
+                    };
+                    last_status = Some(manifest_status.clone());
+                }
+
+                match manifest_status.as_str() {
+                    "completed" => {
+                        let artifact = std::fs::read(&artifact_path)
+                            .ok()
+                            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        yield WaitEvent::Completed {
+                            program_id,
+                            artifact,
+                            waited_ms,
+                        };
+                        return;
+                    }
+                    "failed" => {
+                        let error = std::fs::read(&error_path)
+                            .ok()
+                            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                            .unwrap_or_else(|| serde_json::json!({"message": "no error.json"}));
+                        yield WaitEvent::Failed {
+                            program_id,
+                            error,
+                            waited_ms,
+                        };
+                        return;
+                    }
+                    _ => {}
+                }
+
+                if started_at.elapsed() >= timeout {
+                    yield WaitEvent::TimedOut {
+                        program_id,
+                        last_status: last_status.unwrap_or_else(|| "unknown".into()),
+                        waited_ms,
+                    };
+                    return;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+            }
+        }
+    }
+
     /// Full inspection of one program: manifest + artifact (or error) +
     /// trace line count.
     #[plexus_macros::method(params(program_id = "Program id (UUID)"))]
@@ -309,5 +435,127 @@ mod tests {
         let mut s = Box::pin(stream);
         let evt = s.next().await.expect("event");
         assert!(matches!(evt, InspectEvent::NotFound { .. }));
+    }
+
+    // ─── programs.wait ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn wait_completed_program_returns_artifact_immediately() {
+        let (_dir, programs, p1_id, _) = programs_with_data().await;
+        // p1 is already completed in programs_with_data().
+        let stream = programs.wait(p1_id.to_string(), Some(50), Some(5)).await;
+        let mut s = Box::pin(stream);
+        let mut events = vec![];
+        while let Some(evt) = s.next().await {
+            events.push(evt);
+        }
+        // First event is a Progress with status="completed"; second is Completed.
+        assert!(matches!(events.first(), Some(WaitEvent::Progress { status, .. }) if status == "completed"));
+        assert!(matches!(
+            events.last(),
+            Some(WaitEvent::Completed { artifact, .. }) if artifact.get("probability").is_some()
+        ));
+    }
+
+    #[tokio::test]
+    async fn wait_unknown_program_returns_not_found() {
+        let (_dir, programs, _, _) = programs_with_data().await;
+        let unknown = uuid::Uuid::new_v4().to_string();
+        let stream = programs.wait(unknown, Some(50), Some(2)).await;
+        let mut s = Box::pin(stream);
+        let evt = s.next().await.expect("event");
+        assert!(matches!(evt, WaitEvent::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn wait_running_program_emits_progress_then_terminal() {
+        // Open a program but don't close it. Spawn a task that closes it
+        // after one poll cycle. Wait should emit Progress(running) then
+        // Progress(completed) then Completed.
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(MnemeStorage::open_in_memory().await.unwrap());
+        let context = Arc::new(
+            MnemeContext::with_stub_swarm(dir.path()).with_storage(storage.clone()),
+        );
+        let prog = context.open_program("test.skill", json!({})).await.unwrap();
+        let pid = prog.id().clone();
+
+        // Spawn a task that closes after a short delay.
+        let prog_for_close = prog;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let _ = prog_for_close.close_completed(&json!({"x": 1}), "0.1.0").await;
+        });
+
+        let programs = Programs::new(context);
+        let stream = programs.wait(pid.to_string(), Some(50), Some(5)).await;
+        let mut s = Box::pin(stream);
+
+        let mut saw_running = false;
+        let mut saw_completed_terminal = false;
+        while let Some(evt) = s.next().await {
+            match evt {
+                WaitEvent::Progress { status, .. } if status == "running" => saw_running = true,
+                WaitEvent::Completed { .. } => {
+                    saw_completed_terminal = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_running, "expected at least one Progress(running)");
+        assert!(saw_completed_terminal, "expected terminal Completed");
+    }
+
+    #[tokio::test]
+    async fn wait_failed_program_returns_failed() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(MnemeStorage::open_in_memory().await.unwrap());
+        let context = Arc::new(
+            MnemeContext::with_stub_swarm(dir.path()).with_storage(storage.clone()),
+        );
+        let prog = context.open_program("test.fail", json!({})).await.unwrap();
+        let pid = prog.id().clone();
+        prog.close_failed("TestError", "ran out of nope", "test").await.unwrap();
+
+        let programs = Programs::new(context);
+        let stream = programs.wait(pid.to_string(), Some(50), Some(5)).await;
+        let mut s = Box::pin(stream);
+        let mut saw_failed_terminal = false;
+        while let Some(evt) = s.next().await {
+            if let WaitEvent::Failed { error, .. } = evt {
+                let msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                assert!(msg.contains("ran out of nope"));
+                saw_failed_terminal = true;
+                break;
+            }
+        }
+        assert!(saw_failed_terminal);
+    }
+
+    #[tokio::test]
+    async fn wait_running_program_times_out() {
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(MnemeStorage::open_in_memory().await.unwrap());
+        let context = Arc::new(
+            MnemeContext::with_stub_swarm(dir.path()).with_storage(storage.clone()),
+        );
+        let prog = context.open_program("test.slow", json!({})).await.unwrap();
+        let pid = prog.id().clone();
+        // Don't close. Wait with a tiny timeout.
+
+        let programs = Programs::new(context);
+        let stream = programs.wait(pid.to_string(), Some(100), Some(1)).await; // 1 sec
+        let mut s = Box::pin(stream);
+        let mut saw_timeout = false;
+        while let Some(evt) = s.next().await {
+            if let WaitEvent::TimedOut { last_status, .. } = evt {
+                assert_eq!(last_status, "running");
+                saw_timeout = true;
+                break;
+            }
+        }
+        assert!(saw_timeout);
+        let _ = prog;
     }
 }

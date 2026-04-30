@@ -87,13 +87,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Substrate binary (copied out of the cache mount during the build RUN above)
 COPY --from=builder /build/mneme-substrate-bin /usr/local/bin/mneme-substrate
 
-# Helper scripts available inside the container. The `mneme` CLI is the
-# friendly entry point; the others are the bench / market / ticket
-# pipelines. Users can run `mneme forecast "..."` directly from the
-# in-container shell.
+# Helper scripts available inside the container — bench runners, market
+# watchers, ticket-as-forecast pipelines. Users invoke them as
+# `python3 /workspace/scripts/<name>.py` from the in-container shell.
 COPY mneme-substrate/scripts/ /workspace/scripts/
-RUN chmod +x /workspace/scripts/* \
-    && ln -s /workspace/scripts/mneme /usr/local/bin/mneme
+RUN chmod +x /workspace/scripts/* 2>/dev/null || true
 
 # Where the substrate writes its per-program state. Mount a host dir or
 # named volume here for persistence.
@@ -111,16 +109,24 @@ RUN cat > /etc/motd <<'EOF'
 │  mneme — forecasting substrate (BLF, Murphy 2026)            │
 │                                                              │
 │  Substrate is running on ws://localhost:4456 inside this     │
-│  container. From this shell:                                 │
+│  container. Try:                                             │
 │                                                              │
-│    mneme forecast "Will X happen by Y?"   ← block + print    │
-│    mneme last                              ← last result      │
-│    mneme bench --n 20                      ← run benchmark    │
-│    mneme markets watch                     ← live Manifold    │
-│    mneme tickets predict                   ← design forecasts │
+│  # fire a forecast and stream until done                     │
+│  PID=$(synapse forecast update \                             │
+│      --program-id MY-Q \                                     │
+│      --new-evidence "Will X happen by Y?" \                  │
+│      --trials 3 --iterative-max-steps 5 \                    │
+│    | jq -r 'select(.content.type == "started") |             │
+│             .content.program_id')                            │
+│  synapse programs wait --program-id "$PID"                   │
 │                                                              │
-│  exit returns to your host shell. Substrate keeps running    │
-│  until you `mneme down` (or scripts/run_container.sh stop).  │
+│  # batch tools (Python; existing pipelines)                  │
+│  python3 /workspace/scripts/forecastbench_live_run.py ...    │
+│  python3 /workspace/scripts/marketwatch_live.py              │
+│  python3 /workspace/scripts/ticket_forecast.py               │
+│                                                              │
+│  exit returns to your host shell; substrate keeps running    │
+│  until `make down` (or scripts/run_container.sh stop).       │
 ╰──────────────────────────────────────────────────────────────╯
 
 EOF

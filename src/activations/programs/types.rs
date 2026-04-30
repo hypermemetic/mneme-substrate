@@ -58,6 +58,42 @@ pub enum InspectEvent {
     Error { message: String },
 }
 
+/// Events from programs.wait — block-and-stream until a fire-and-return
+/// program reaches a terminal state.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WaitEvent {
+    /// Emitted on status transitions (running → completed/failed).
+    /// The first poll always emits one Progress with the initial status
+    /// so consumers know what state the program started in.
+    Progress {
+        program_id: String,
+        status: String,
+        age_ms: u64,
+    },
+    /// Terminal: program completed successfully. Carries the artifact.
+    Completed {
+        program_id: String,
+        artifact: serde_json::Value,
+        waited_ms: u64,
+    },
+    /// Terminal: program failed. Carries the error.
+    Failed {
+        program_id: String,
+        error: serde_json::Value,
+        waited_ms: u64,
+    },
+    /// Terminal: hit timeout cap before reaching a final state.
+    TimedOut {
+        program_id: String,
+        last_status: String,
+        waited_ms: u64,
+    },
+    /// Terminal: the program directory doesn't exist (id wrong, or program
+    /// hasn't been opened yet by the substrate).
+    NotFound { program_id: String },
+}
+
 pub fn status_string(s: ProgramStatus) -> String {
     match s {
         ProgramStatus::Running => "running",

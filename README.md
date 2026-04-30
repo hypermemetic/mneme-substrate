@@ -11,72 +11,59 @@ This README is the **operator's guide** — how to run it, how to fire forecasts
 You need:
 - macOS or Linux
 - Docker Desktop / Podman / Colima (any Docker-API-compatible runtime)
-- A Claude subscription with the `claude` CLI installed (the run script will trigger `claude /login` if you don't have an OAuth token yet)
+- A Claude subscription with the `claude` CLI installed (the run script triggers `claude /login` automatically if you don't have an OAuth token yet)
+- [`synapse`](https://github.com/hypermemetic/synapse) CLI on the host (for invoking the substrate; no other tools needed)
 
 ```bash
 git clone git@github.com:hypermemetic/mneme-substrate.git
 cd mneme-substrate
-
-make install         # symlink the `mneme` CLI into ~/.local/bin
 make build           # build the container (~3 min cold; ~30s incremental thanks to BuildKit cache mounts)
 make run             # start substrate detached, drop into the container shell
 ```
 
-That's it. `make run` does:
+`make run` does:
 
 1. Resolves your auth token (priority: `ANTHROPIC_API_KEY` env → `CLAUDE_CODE_OAUTH_TOKEN` env → macOS Keychain entry `"Claude Code-credentials"`). If none of those have a token, it runs `claude /login` automatically.
 2. Starts the substrate in the container, bound to `ws://localhost:4456`, with `programs/` and `.plexus-state/` bind-mounted to host disk so state survives restarts.
-3. `docker exec`s you into the container with the `mneme` CLI on PATH and a friendly MOTD.
+3. `docker exec`s you into the container with a friendly MOTD.
 
 `exit` returns you to your host shell. The substrate keeps running until `make down`.
 
 ## Fire your first forecast
 
-From inside the container shell (after `make run`):
+`forecast.update` is fire-and-return at the protocol level. Pipe its `program_id` into `programs.wait` to block until the answer lands:
 
 ```bash
-mneme forecast "Will Bitcoin trade above \$200,000 on any day before 2026-12-31?"
+PID=$(synapse -P 4456 substrate forecast update \
+        --program-id MY-Q-001 \
+        --new-evidence "Will Bitcoin trade above \$200,000 on any day before 2026-12-31?" \
+        --trials 3 \
+        --iterative-max-steps 5 \
+      | jq -r 'select(.content.type == "started") | .content.program_id')
+
+synapse -P 4456 substrate programs wait --program-id "$PID"
 ```
 
-That blocks until completion (~2-5 min) and prints the structured belief: probability, calibrated + raw, evidence_for, evidence_against, open_questions.
+The wait stream emits `progress` events on each status change and ends with a terminal `completed` event carrying the artifact, or `failed`/`timed_out`/`not_found`. Synapse renders the events natively.
 
-From the **host** (after `make install`, anywhere with the substrate running):
-
-```bash
-mneme forecast "Will Bitcoin trade above \$200,000 on any day before 2026-12-31?" --trials 3 --steps 5
-mneme last              # show the most recent program's belief
-mneme status <id>       # check program status
-mneme wait <id>         # block until done + print
-mneme resolve <id> no   # record outcome; calibration store grows
-```
-
-If you'd rather use synapse directly (bypassing the wrapper):
-
-```bash
-synapse -P 4456 substrate forecast update \
-  --program-id MY-Q-001 \
-  --new-evidence "Will Bitcoin trade above \$200K by 2026-12-31?" \
-  --trials 3 \
-  --iterative-max-steps 5
-
-# Returns immediately with Started { program_id }. The work is fire-and-return.
-# To see the result, either re-run `mneme wait <program_id>`, or watch `programs/<program_id>/`.
-```
-
-The artifact has:
+The artifact contains:
 - `probability` — calibrated point estimate
-- `raw_probability` — pre-Platt aggregate (so consumers can recalibrate against a later-fit Platt model)
+- `raw_probability` — pre-Platt aggregate
 - `evidence_for` / `evidence_against` — arrays of `{claim, source, weight}`
 - `open_questions` — what would tighten the answer
 - `summary` — deterministic prose render
 - `n_trials` / `confidence` / `belief_schema_version`
 
+You can call `programs.wait` against any program — useful for resuming after disconnect, or polling a forecast someone else fired:
+
+```bash
+synapse -P 4456 substrate programs wait --program-id <id> --poll-interval-ms 3000 --timeout-secs 600
+```
+
 ## Resolve it later
 
 ```bash
-mneme resolve <program_id> yes      # or `no`
-# equivalent synapse:
-#   synapse -P 4456 substrate forecast resolve --program-id <id> --actual true
+synapse -P 4456 substrate forecast resolve --program-id <id> --actual true
 ```
 
 Once you have ≥10 resolved observations, Platt calibration kicks in automatically; subsequent forecasts have `probability != raw_probability` reflecting the bias correction.
@@ -92,10 +79,14 @@ curl -L -o programs/_benchmarks/forecastbench/2024-07-21_resolution_set.json \
   https://raw.githubusercontent.com/forecastingresearch/forecastbench-datasets/main/datasets/resolution_sets/2024-07-21_resolution_set.json
 
 # n=20 paired vs the prediction-market crowd, ~10 min wall-clock at concurrency=4
-mneme bench --n 20 --name mybench
+python3 scripts/forecastbench_live_run.py \
+  --question-set programs/_benchmarks/forecastbench/2024-07-21-llm.json \
+  --resolution-set programs/_benchmarks/forecastbench/2024-07-21_resolution_set.json \
+  --n 20 --concurrency 4 --port 4456 --trials 2 --iterative-max-steps 5 \
+  --output programs/_benchmarks/runs/$(date +%Y%m%d-%H%M%S)-mybench/
 ```
 
-Reports independent + paired Brier Index for both mneme and the crowd, with bootstrap 95% CIs. Per-source breakdowns. The default in v0.1 will land you somewhere near our bench-005 result (BI ~84 vs crowd ~70 on this contaminated 2024 sample).
+Reports independent + paired Brier Index for both mneme and the crowd, with bootstrap 95% CIs. The default in v0.1 will land you somewhere near our bench-005 result (BI ~84 vs crowd ~70 on this contaminated 2024 sample).
 
 For honest post-cutoff held-out evaluation see `scripts/forecastbench_holdout_run.py` and result docs in [`mneme/plans/BLFX/results/`](https://github.com/hypermemetic/mneme/tree/master/plans/BLFX/results).
 
@@ -104,8 +95,8 @@ For honest post-cutoff held-out evaluation see `scripts/forecastbench_holdout_ru
 The live marketplace pipeline runs the substrate continuously against open prediction markets. No web-search contamination is possible — the answers don't exist yet.
 
 ```bash
-mneme markets watch         # pick ~10 open binary markets, log paired (manifold_p, our_p)
-mneme markets resolve       # sweep resolved markets, feed calibration store
+python3 scripts/marketwatch_live.py --max-markets 10 --port 4456     # forecast pass
+python3 scripts/marketwatch_resolve.py --port 4456                    # resolution sweep
 ```
 
 Designed for cron — see `scripts/marketwatch_README.md`. Pairings accumulate in `programs/_marketwatch/pairings.jsonl`; the dataset that grows over weeks/months is what eventually produces defensible product claims.
@@ -128,8 +119,8 @@ forecast:
 Then:
 
 ```bash
-mneme tickets predict       # fires forecast.update for each ticket with a forecast: block
-mneme tickets resolve       # CLI prompt for actual outcome; calls forecast.resolve
+python3 scripts/ticket_forecast.py --plans-dir ../mneme/plans
+python3 scripts/ticket_resolve.py --plans-dir ../mneme/plans
 ```
 
 The substrate's same forecasting machinery applied to its own design choices. Over time, the calibration store accumulates rows specifically about the system's design intuitions — meta-evidence about whether to trust the system on design questions.

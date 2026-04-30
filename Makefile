@@ -1,7 +1,6 @@
-# mneme-substrate — host-side install + container management
+# mneme-substrate — host-side container management
 #
 # Quick start:
-#   make install    # symlink the `mneme` CLI to ~/.local/bin
 #   make build      # build the container image (~3 min cold, ~30s incremental)
 #   make run        # start substrate, drop into container shell
 #                   # (substrate runs in background; exit shell to leave it running)
@@ -20,10 +19,7 @@
 #   make stop-host    # kill the host process
 #   make log-host     # tail its log
 
-PREFIX        ?= $(HOME)/.local
-BIN_DIR       ?= $(PREFIX)/bin
 SUBSTRATE_DIR := $(realpath .)
-SCRIPTS_DIR   := $(SUBSTRATE_DIR)/scripts
 SYNAPSE       := $(shell command -v synapse 2>/dev/null)
 DOCKER        := $(shell command -v docker 2>/dev/null || command -v podman 2>/dev/null)
 CLAUDE        := $(shell command -v claude 2>/dev/null)
@@ -33,13 +29,12 @@ HOST_BIN     := target/debug/mneme-substrate
 HOST_LOG     := /tmp/substrate.log
 HOST_PIDFILE := /tmp/substrate.pid
 
-.PHONY: help install build run up down stop logs shell test login clean check-deps \
+.PHONY: help build run up down stop logs shell test login clean check-deps \
         build-host start-host stop-host restart-host log-host
 
 help:
 	@echo "mneme-substrate — make targets:"
 	@echo ""
-	@echo "  install   — symlink the mneme CLI into ~/.local/bin"
 	@echo "  build     — build the container image"
 	@echo "  run       — start substrate + drop into container shell"
 	@echo "  up        — alias for run"
@@ -55,10 +50,11 @@ help:
 	@echo "    start-host  — run substrate as a host process on port 4444"
 	@echo "    stop-host / restart-host / log-host"
 	@echo ""
-	@echo "  Optional host tools:"
-	@echo "    synapse  — Plexus RPC CLI client"
-	@echo "    docker (or podman, colima)"
+	@echo "  Required host tools:"
+	@echo "    docker (or podman / colima)"
 	@echo "    claude   — Claude Code CLI; supplies the OAuth token"
+	@echo "  Optional:"
+	@echo "    synapse  — Plexus RPC CLI client (recommended for forecasts)"
 	@echo ""
 	@echo "  See README.md for installation links."
 
@@ -81,22 +77,6 @@ check-deps:
 	else \
 	  echo "✓ claude: $(CLAUDE)"; \
 	fi
-
-install: check-deps
-	@mkdir -p $(BIN_DIR)
-	@if [ -L $(BIN_DIR)/mneme ] || [ -e $(BIN_DIR)/mneme ]; then \
-	  rm -f $(BIN_DIR)/mneme; \
-	fi
-	@ln -s $(SCRIPTS_DIR)/mneme $(BIN_DIR)/mneme
-	@echo "✓ mneme CLI symlinked: $(BIN_DIR)/mneme → $(SCRIPTS_DIR)/mneme"
-	@if ! echo "$$PATH" | tr ':' '\n' | grep -qx "$(BIN_DIR)"; then \
-	  echo ""; \
-	  echo "  ⚠  $(BIN_DIR) is not on your PATH."; \
-	  echo "  Add this to your shell rc:"; \
-	  echo "      export PATH=\"$(BIN_DIR):\$$PATH\""; \
-	fi
-	@echo ""
-	@echo "next: make build && make run"
 
 build: check-deps
 	bash scripts/run_container.sh build

@@ -31,20 +31,51 @@ make run             # start substrate detached, drop into the container shell
 
 ## Fire your first forecast
 
-`forecast.update` is fire-and-return at the protocol level. Pipe its `program_id` into `programs.wait` to block until the answer lands:
+`forecast.update` is fire-and-return at the protocol level — it opens a new program for the update, kicks the work into the background, and returns immediately. You get back a `started` event with a `program_id`. Copy that, then `programs wait` against it to block until the answer lands.
 
 ```bash
-PID=$(synapse -P 4456 substrate forecast update \
-        --program-id MY-Q-001 \
-        --new-evidence "Will Bitcoin trade above \$200,000 on any day before 2026-12-31?" \
-        --trials 3 \
-        --iterative-max-steps 5 \
-      | jq -r 'select(.content.type == "started") | .content.program_id')
+$ synapse -P 4456 substrate forecast update \
+    --program-id MY-Q-001 \
+    --new-evidence "Will Bitcoin trade above \$200,000 on any day before 2026-12-31?" \
+    --trials 3 --iterative-max-steps 5
 
-synapse -P 4456 substrate programs wait --program-id "$PID"
+prior:
+  belief_schema_version: 0.3.0
+  confidence: single-pass
+  probability: 0.5
+  ...
+program_id: 7fbbf382-accd-4926-8a2b-b9e6d68df59d
+type: started
 ```
 
-The wait stream emits `progress` events on each status change and ends with a terminal `completed` event carrying the artifact, or `failed`/`timed_out`/`not_found`. Synapse renders the events natively.
+Note the `program_id`. (`--program-id MY-Q-001` was the *question's* id you provided; the substrate opened a new program for this update with its own UUID.) Wait on it:
+
+```bash
+$ synapse -P 4456 substrate programs wait \
+    --program-id 7fbbf382-accd-4926-8a2b-b9e6d68df59d
+
+type: progress
+program_id: 7fbbf382-accd-4926-8a2b-b9e6d68df59d
+status: running
+age_ms: 0
+
+type: progress
+program_id: 7fbbf382-accd-4926-8a2b-b9e6d68df59d
+status: completed
+age_ms: 60116
+
+type: completed
+program_id: 7fbbf382-accd-4926-8a2b-b9e6d68df59d
+waited_ms: 60116
+artifact:
+  probability: 0.140
+  raw_probability: 0.180
+  n_trials: 3
+  evidence_for: [...]
+  evidence_against: [...]
+  open_questions: [...]
+  summary: "FOR: ... AGAINST: ..."
+```
 
 The artifact contains:
 - `probability` — calibrated point estimate
@@ -54,11 +85,7 @@ The artifact contains:
 - `summary` — deterministic prose render
 - `n_trials` / `confidence` / `belief_schema_version`
 
-You can call `programs.wait` against any program — useful for resuming after disconnect, or polling a forecast someone else fired:
-
-```bash
-synapse -P 4456 substrate programs wait --program-id <id> --poll-interval-ms 3000 --timeout-secs 600
-```
+`programs wait` is fine to call against any program (your own running ones, ones from a previous session, ones a teammate fired) — it just polls the manifest and emits events. Adjustable knobs: `--poll-interval-ms` (default 2000), `--timeout-secs` (default 900).
 
 ## Resolve it later
 

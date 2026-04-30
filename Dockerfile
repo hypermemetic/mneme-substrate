@@ -109,21 +109,24 @@ RUN cat > /etc/motd <<'EOF'
 │  mneme — forecasting substrate (BLF, Murphy 2026)            │
 │                                                              │
 │  Substrate is running on ws://localhost:4456 inside this     │
-│  container. Try:                                             │
+│  container.                                                  │
 │                                                              │
-│  # fire a forecast and stream until done                     │
-│  PID=$(synapse forecast update \                             │
-│      --program-id MY-Q \                                     │
-│      --new-evidence "Will X happen by Y?" \                  │
-│      --trials 3 --iterative-max-steps 5 \                    │
-│    | jq -r 'select(.content.type == "started") |             │
-│             .content.program_id')                            │
-│  synapse programs wait --program-id "$PID"                   │
+│  Fire a forecast (returns a program_id immediately):         │
 │                                                              │
-│  # batch tools (Python; existing pipelines)                  │
-│  python3 /workspace/scripts/forecastbench_live_run.py ...    │
-│  python3 /workspace/scripts/marketwatch_live.py              │
-│  python3 /workspace/scripts/ticket_forecast.py               │
+│    synapse substrate forecast update \                       │
+│        --program-id MY-Q \                                   │
+│        --new-evidence "Will X happen by Y?" \                │
+│        --trials 3 --iterative-max-steps 5                    │
+│                                                              │
+│  Copy the program_id from the output, then wait on it:       │
+│                                                              │
+│    synapse substrate programs wait \                         │
+│        --program-id <paste_uuid_here>                        │
+│                                                              │
+│  Batch pipelines:                                            │
+│    python3 /workspace/scripts/forecastbench_live_run.py …    │
+│    python3 /workspace/scripts/marketwatch_live.py            │
+│    python3 /workspace/scripts/ticket_forecast.py             │
 │                                                              │
 │  exit returns to your host shell; substrate keeps running    │
 │  until `make down` (or scripts/run_container.sh stop).       │

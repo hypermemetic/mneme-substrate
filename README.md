@@ -234,6 +234,16 @@ cargo build --release --bin mneme-substrate  # release binary
 
 **Forecast hangs >10 min** — typically a metaculus question with a complex resolution criterion the model gets stuck on. Check `programs/<id>/sessions/` and the substrate logs (`docker logs mneme | tail -200`). The lenient EvidenceItem parser + JSON-cleanup recovery (per MNEME-29) eliminates ~95% of parse-failure-driven aborts since v0.1.
 
+**Why did the substrate predict X?** — single command walks the full audit trail (manifest → artifact → trace → per-step (action, observation, belief) for each trial → chat turns) into one readable tree:
+
+```bash
+python3 scripts/inspect_program_tree.py <program_id>            # human view
+python3 scripts/inspect_program_tree.py <program_id> --turns    # +chat history
+python3 scripts/inspect_program_tree.py <program_id> --json     # machine view
+```
+
+Per-step structured history exists for programs run after MNEME-35 ships (April 2026); older programs gracefully render with `step_history: (none — pre-MNEME-35 program)` and rely on the chat-turns view for reasoning.
+
 **Container restart wipes state** — should not happen in v0.1; `.plexus-state/` is bind-mounted. If it does, check `bash scripts/run_container.sh up` printed `plexus state: bind-mounting ... to /root/.plexus`. If that line is missing your local copy of `scripts/run_container.sh` is older — git pull.
 
 ## Lineage

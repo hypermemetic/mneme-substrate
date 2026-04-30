@@ -111,6 +111,7 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
         // the single biggest wall-clock blocker — K=N took N× the per-trial
         // wall clock. Each trial forks the parent session independently and
         // runs its own chat loop; claudecode supports concurrent forks.
+        let program_dir = program.directory().root().to_path_buf();
         let trial_futures = (0..params.n).map(|trial_index| {
             let claudecode = self.claudecode.clone();
             let parent_session = params.parent_session.clone();
@@ -119,6 +120,12 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
             let timeout = params.timeout;
             let allowed_tools = params.allowed_tools.clone();
             let iterative = params.iterative_max_steps;
+            // MNEME-35: per-trial structured history is the audit object
+            // that justifies the final probability. Iterative trials get a
+            // history file; single-shot trials don't (no per-step state).
+            let history_path = iterative.map(|_| {
+                program_dir.join(format!("trial_{}_history.jsonl", trial_index))
+            });
             async move {
                 let trial_start = Instant::now();
                 let outcome = match iterative {
@@ -131,6 +138,7 @@ impl<P: HubContext + 'static> SwarmRuntime for ClaudeCodeSwarmRuntime<P> {
                             t_max,
                             timeout,
                             allowed_tools,
+                            history_path,
                         )
                         .await
                     }
@@ -303,6 +311,12 @@ fn chat_usage_to_trial_usage(u: ChatUsage) -> TrialUsage {
 /// which sends one chat per step and parses (action, belief) from each
 /// response. Returns the final belief serialized as JSON for downstream
 /// aggregation, plus the accumulated per-step token usage.
+///
+/// MNEME-35: when `history_path` is `Some`, the structured per-step
+/// `(action, observation, belief)` history is persisted as JSON-lines
+/// at that path. This is the audit object that justifies the final
+/// probability — without it the per-step beliefs only survive as
+/// embedded prose in claudecode_messages, which is harder to query.
 async fn run_iterative_trial<P: HubContext + 'static>(
     claudecode: Arc<ClaudeCode<P>>,
     parent: String,
@@ -311,6 +325,7 @@ async fn run_iterative_trial<P: HubContext + 'static>(
     max_steps: u8,
     timeout: Duration,
     allowed_tools: Option<Vec<String>>,
+    history_path: Option<std::path::PathBuf>,
 ) -> Result<(String, Option<TrialUsage>), String> {
     // Fork the parent session for this trial.
     let fork_stream = claudecode.fork(parent.clone(), new_name.clone()).await;
@@ -344,7 +359,20 @@ async fn run_iterative_trial<P: HubContext + 'static>(
     };
 
     match tokio::time::timeout(timeout, loop_future).await {
-        Ok(Ok((belief, _history))) => {
+        Ok(Ok((belief, history))) => {
+            // MNEME-35: persist the structured per-step history before
+            // returning. A failure to write should not fail the trial —
+            // we still have a valid belief to aggregate; the audit log is
+            // best-effort.
+            if let Some(path) = history_path.as_ref() {
+                if let Err(e) = persist_trial_history(path, &history) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "MNEME-35: failed to persist trial history (non-fatal)"
+                    );
+                }
+            }
             let belief_json = serde_json::to_string(&belief)
                 .map_err(|e| format!("serialize belief: {}", e))?;
             let usage = driver.into_usage();
@@ -358,6 +386,30 @@ async fn run_iterative_trial<P: HubContext + 'static>(
         Ok(Err(loop_err)) => Err(format!("iterative trial: {}", loop_err)),
         Err(_) => Err(format!("iterative trial timed out after {:?}", timeout)),
     }
+}
+
+/// MNEME-35: write per-step (action, observation, belief) history as
+/// JSON-lines. One row per step. Schema:
+/// `{"step_idx": u8, "action": ..., "observation": ..., "belief": ...}`
+fn persist_trial_history(
+    path: &std::path::Path,
+    history: &[crate::activations::forecast::HistoryEntry],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(path)?;
+    for (step_idx, entry) in history.iter().enumerate() {
+        let row = serde_json::json!({
+            "step_idx": step_idx as u8,
+            "action": entry.action,
+            "observation": entry.observation,
+            "belief": entry.belief,
+        });
+        writeln!(file, "{}", row)?;
+    }
+    Ok(())
 }
 
 /// Parse the assistant's final text as the trial's typed response.
@@ -445,5 +497,71 @@ mod tests {
         // gobbling the whole tail.
         let text = "```json\n{\"x\":1}\nno close fence";
         assert!(extract_json_block(text).is_none());
+    }
+
+    /// MNEME-35: the structured per-step history must round-trip
+    /// through persist_trial_history → re-parse, and one row per step.
+    #[test]
+    fn persist_trial_history_writes_jsonlines_round_trip() {
+        use crate::activations::forecast::{
+            Action, HistoryEntry, Observation, TrialResponse,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("trial_0_history.jsonl");
+
+        let belief = serde_json::from_value::<TrialResponse>(json!({
+            "probability": 0.42,
+            "summary": "midway",
+            "evidence_for": [],
+            "evidence_against": [],
+            "open_questions": []
+        }))
+        .unwrap();
+
+        let history = vec![
+            HistoryEntry {
+                action: Action::WebSearch { query: "BTC March 2026".into(), k: 5 },
+                observation: Observation::Error { message: "stub for test".into() },
+                belief: belief.clone(),
+            },
+            HistoryEntry {
+                action: Action::LookupUrl { url: "https://example.com/page".into() },
+                observation: Observation::PageContent {
+                    url: "https://example.com/page".into(),
+                    content: "page text".into(),
+                    fetched_at: chrono::Utc::now(),
+                },
+                belief: belief.clone(),
+            },
+        ];
+
+        persist_trial_history(&path, &history).expect("write should succeed");
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "one row per step");
+
+        let row0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(row0["step_idx"], 0);
+        assert_eq!(row0["action"]["type"], "web_search");
+        assert_eq!(row0["action"]["query"], "BTC March 2026");
+        assert_eq!(row0["belief"]["probability"], 0.42);
+
+        let row1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(row1["step_idx"], 1);
+        assert_eq!(row1["action"]["type"], "lookup_url");
+        assert_eq!(row1["observation"]["type"], "page_content");
+    }
+
+    /// MNEME-35: writing into a directory that doesn't exist creates the
+    /// parent (the program dir always exists in production but this
+    /// guards against ordering changes in test fixtures).
+    #[test]
+    fn persist_trial_history_creates_parent_dir() {
+        use crate::activations::forecast::HistoryEntry;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nested/program-dir/trial_0_history.jsonl");
+        let history: Vec<HistoryEntry> = vec![];
+        persist_trial_history(&path, &history).expect("write should succeed");
+        assert!(path.exists());
     }
 }

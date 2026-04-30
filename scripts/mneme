@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""
+mneme — friendly CLI on top of the substrate.
+
+Wraps synapse with block-and-print UX, container management, and
+batch scripts. For the underlying RPC see `synapse -P 4456 substrate
+forecast update --help`.
+
+Usage:
+  mneme forecast "Will X happen by date Y?" [--trials 3] [--steps 5]
+                                            [--no-iterative]
+                                            [--allow-tool WebSearch]
+                                            [--id MY-Q-001]
+                                            [--port 4456]
+  mneme wait <program_id>          # poll until done, print artifact
+  mneme resolve <program_id> yes|no
+  mneme status <program_id>
+  mneme last                       # print the most recent program
+
+  mneme bench [--n 20]             # run forecastbench against vendored data
+  mneme markets watch              # marketwatch_live.py
+  mneme markets resolve            # marketwatch_resolve.py
+
+  mneme tickets predict            # ticket_forecast.py
+  mneme tickets resolve            # ticket_resolve.py
+
+  mneme up                         # start container + drop into shell
+  mneme down                       # stop container
+  mneme logs                       # tail substrate logs
+  mneme shell                      # exec into running container
+  mneme login                      # run claude /login flow
+"""
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def find_substrate_dir():
+    """Find mneme-substrate root by walking up from here."""
+    here = Path(__file__).resolve().parent
+    if (here.parent / "scripts" / "mneme").exists() or here.name == "scripts":
+        return here.parent
+    return Path.cwd()
+
+
+SUBSTRATE_DIR = find_substrate_dir()
+
+
+def run(cmd, **kw):
+    """Run a command, stream stdout, return exit code."""
+    return subprocess.call(cmd, cwd=SUBSTRATE_DIR, **kw)
+
+
+def synapse_call(method, params: dict, port: int):
+    """Call a substrate method via synapse, return parsed events."""
+    args = ["synapse", "-j", "-P", str(port), "substrate"] + method.split(".") + []
+    for k, v in params.items():
+        flag = "--" + k.replace("_", "-")
+        if isinstance(v, bool):
+            args += [flag, "true" if v else "false"]
+        elif isinstance(v, list):
+            # Synapse's array-arg ergonomics is fragile; fall back to global -p
+            return synapse_call_with_p(method, params, port)
+        else:
+            args += [flag, str(v)]
+    return _parse_synapse_output(subprocess.run(args, capture_output=True, text=True))
+
+
+def synapse_call_with_p(method, params: dict, port: int):
+    """Fall-back invocation form for arrays. Equivalent to -p '{...}'."""
+    args = ["synapse", "-j", "-P", str(port), "-p", json.dumps(params),
+            "substrate"] + method.split(".")
+    return _parse_synapse_output(subprocess.run(args, capture_output=True, text=True))
+
+
+def _parse_synapse_output(proc):
+    if proc.returncode != 0:
+        raise RuntimeError(f"synapse failed: {proc.stderr[:400]}")
+    events = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except Exception:
+            pass
+    return events
+
+
+def get_started_program_id(events):
+    for evt in events:
+        if evt.get("type") == "data":
+            content = evt.get("content") or {}
+            if content.get("type") == "started":
+                return content.get("program_id")
+    return None
+
+
+def fmt_belief(artifact: dict) -> str:
+    """Pretty-print an artifact for terminal output."""
+    p = artifact.get("probability")
+    raw = artifact.get("raw_probability")
+    n = artifact.get("n_trials")
+    conf = artifact.get("confidence")
+    out = []
+    out.append("")
+    out.append(f"  probability:     {p:.3f}" if p is not None else "  probability:     ?")
+    if raw is not None and raw != p:
+        out.append(f"  raw (pre-Platt): {raw:.3f}")
+    if n:
+        out.append(f"  n_trials:        {n}")
+    if conf:
+        out.append(f"  confidence:      {conf}")
+    ef = artifact.get("evidence_for") or []
+    ea = artifact.get("evidence_against") or []
+    oq = artifact.get("open_questions") or []
+    if ef:
+        out.append("")
+        out.append("  evidence_for:")
+        for e in ef[:8]:
+            if isinstance(e, dict):
+                w = e.get("weight", "")
+                w_str = f"({w:.2f}) " if isinstance(w, (int, float)) else ""
+                out.append(f"    • {w_str}{e.get('claim', '')[:120]}")
+            else:
+                out.append(f"    • {str(e)[:120]}")
+    if ea:
+        out.append("")
+        out.append("  evidence_against:")
+        for e in ea[:8]:
+            if isinstance(e, dict):
+                w = e.get("weight", "")
+                w_str = f"({w:.2f}) " if isinstance(w, (int, float)) else ""
+                out.append(f"    • {w_str}{e.get('claim', '')[:120]}")
+            else:
+                out.append(f"    • {str(e)[:120]}")
+    if oq:
+        out.append("")
+        out.append("  open_questions:")
+        for q in oq[:5]:
+            out.append(f"    ? {str(q)[:120]}")
+    return "\n".join(out)
+
+
+def cmd_forecast(args):
+    pid = args.id or f"Q-{int(time.time())}"
+    params = {
+        "program-id": pid,
+        "new-evidence": args.question,
+        "trials": args.trials,
+    }
+    if not args.no_iterative:
+        params["iterative-max-steps"] = args.steps
+    # allowed_tools is the array-arg sharp edge — use the json-fallback form
+    cli_params = {
+        "program_id": pid,
+        "new_evidence": args.question,
+        "trials": args.trials,
+    }
+    if not args.no_iterative:
+        cli_params["iterative_max_steps"] = args.steps
+    if args.allow_tool:
+        cli_params["allowed_tools"] = args.allow_tool
+
+    print(f"firing forecast (program_id={pid}, trials={args.trials}, "
+          f"iterative={'on' if not args.no_iterative else 'off'})...")
+    try:
+        if args.allow_tool:
+            events = synapse_call_with_p("forecast.update", cli_params, args.port)
+        else:
+            events = synapse_call("forecast.update", params, args.port)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    program_id = get_started_program_id(events)
+    if not program_id:
+        print(f"ERROR: no program_id in synapse response", file=sys.stderr)
+        return 1
+    print(f"  program_id: {program_id}")
+    return _wait_and_print(program_id, port=args.port, timeout_s=args.timeout)
+
+
+def _wait_and_print(program_id: str, *, port: int, timeout_s: int):
+    artifact_path = SUBSTRATE_DIR / "programs" / program_id / "artifact.json"
+    error_path = SUBSTRATE_DIR / "programs" / program_id / "error.json"
+    deadline = time.time() + timeout_s
+    print(f"  waiting (poll every 3s, max {timeout_s}s)...", flush=True)
+    last_print = time.time()
+    while time.time() < deadline:
+        if artifact_path.exists():
+            try:
+                a = json.loads(artifact_path.read_text())
+                print(fmt_belief(a))
+                return 0
+            except Exception as e:
+                print(f"ERROR: artifact parse failed: {e}", file=sys.stderr)
+                return 1
+        if error_path.exists():
+            print(f"\nERROR: program failed:")
+            print(error_path.read_text())
+            return 1
+        if time.time() - last_print > 30:
+            elapsed = int(time.time() - (deadline - timeout_s))
+            print(f"  still running ({elapsed}s elapsed)...", flush=True)
+            last_print = time.time()
+        time.sleep(3)
+    print(f"\nTIMEOUT after {timeout_s}s. Program may still complete; run "
+          f"`mneme wait {program_id}` to keep checking.", file=sys.stderr)
+    return 2
+
+
+def cmd_wait(args):
+    return _wait_and_print(args.program_id, port=args.port, timeout_s=args.timeout)
+
+
+def cmd_resolve(args):
+    actual = args.outcome.lower() in ("yes", "y", "true", "1")
+    params = {"program-id": args.program_id, "actual": actual}
+    try:
+        events = synapse_call("forecast.resolve", params, args.port)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    for evt in events:
+        if evt.get("type") == "data":
+            c = evt.get("content") or {}
+            if c.get("type") == "resolved":
+                print(f"resolved: program_id={c.get('program_id')} "
+                      f"predicted={c.get('predicted'):.3f} actual={c.get('actual')}")
+                return 0
+            if c.get("type") == "error":
+                print(f"ERROR: {c.get('message')}", file=sys.stderr)
+                return 1
+    print("ERROR: no resolved event", file=sys.stderr)
+    return 1
+
+
+def cmd_status(args):
+    manifest_path = SUBSTRATE_DIR / "programs" / args.program_id / "manifest.json"
+    if not manifest_path.exists():
+        print(f"no manifest at {manifest_path}", file=sys.stderr)
+        return 1
+    m = json.loads(manifest_path.read_text())
+    print(json.dumps({
+        "program_id": m.get("program_id"),
+        "status": m.get("status"),
+        "entry_skill": m.get("entry_skill"),
+        "started_at": m.get("started_at"),
+        "finished_at": m.get("finished_at"),
+    }, indent=2))
+    return 0
+
+
+def cmd_last(args):
+    progs = SUBSTRATE_DIR / "programs"
+    if not progs.exists():
+        print("no programs dir")
+        return 1
+    candidates = []
+    for child in progs.iterdir():
+        if child.is_dir() and not child.name.startswith("_"):
+            mf = child / "manifest.json"
+            if mf.exists():
+                candidates.append((mf.stat().st_mtime, child.name))
+    candidates.sort(reverse=True)
+    if not candidates:
+        print("no programs found")
+        return 1
+    pid = candidates[0][1]
+    print(f"last program: {pid}")
+    artifact = progs / pid / "artifact.json"
+    if artifact.exists():
+        print(fmt_belief(json.loads(artifact.read_text())))
+    else:
+        manifest = progs / pid / "manifest.json"
+        m = json.loads(manifest.read_text())
+        print(f"  status: {m.get('status')}")
+    return 0
+
+
+def cmd_bench(args):
+    cmd = ["python3", "scripts/forecastbench_live_run.py",
+           "--question-set", "programs/_benchmarks/forecastbench/2024-07-21-llm.json",
+           "--resolution-set", "programs/_benchmarks/forecastbench/2024-07-21_resolution_set.json",
+           "--n", str(args.n), "--concurrency", str(args.concurrency),
+           "--port", str(args.port), "--trials", str(args.trials),
+           "--iterative-max-steps", str(args.steps),
+           "--output", f"programs/_benchmarks/runs/{time.strftime('%Y%m%d-%H%M%S')}-{args.name}/"]
+    return run(cmd)
+
+
+def cmd_markets(args):
+    if args.action == "watch":
+        return run(["python3", "scripts/marketwatch_live.py",
+                    "--max-markets", str(args.max),
+                    "--port", str(args.port),
+                    "--trials", str(args.trials),
+                    "--iterative-max-steps", str(args.steps)])
+    elif args.action == "resolve":
+        return run(["python3", "scripts/marketwatch_resolve.py", "--port", str(args.port)])
+    print(f"unknown markets action: {args.action}", file=sys.stderr)
+    return 1
+
+
+def cmd_tickets(args):
+    if args.action == "predict":
+        return run(["python3", "scripts/ticket_forecast.py",
+                    "--plans-dir", args.plans_dir, "--port", str(args.port)])
+    elif args.action == "resolve":
+        return run(["python3", "scripts/ticket_resolve.py",
+                    "--plans-dir", args.plans_dir, "--port", str(args.port)])
+    print(f"unknown tickets action: {args.action}", file=sys.stderr)
+    return 1
+
+
+def cmd_up(args):
+    return run(["bash", "scripts/run_container.sh", "up"] + (["-d"] if args.detach else []))
+
+
+def cmd_down(args):
+    return run(["bash", "scripts/run_container.sh", "stop"])
+
+
+def cmd_logs(args):
+    return run(["bash", "scripts/run_container.sh", "logs"])
+
+
+def cmd_shell(args):
+    return run(["bash", "scripts/run_container.sh", "shell"])
+
+
+def cmd_login(args):
+    """Run claude /login if no token detected on host Keychain."""
+    # Check macOS Keychain first
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            try:
+                blob = json.loads(out.stdout.strip())
+                token = blob.get("claudeAiOauth", {}).get("accessToken", "")
+                if token.startswith("sk-ant-oat"):
+                    print(f"already logged in (token: {token[:20]}...)")
+                    return 0
+            except Exception:
+                pass
+    except FileNotFoundError:
+        pass
+    # Need to login
+    if not subprocess.run(["which", "claude"], capture_output=True).returncode == 0:
+        print("ERROR: 'claude' CLI not found on PATH.", file=sys.stderr)
+        print("Install via: https://docs.claude.com/en/docs/claude-code/quickstart", file=sys.stderr)
+        return 1
+    print("no Claude OAuth token found. Launching `claude /login`...")
+    return subprocess.call(["claude", "/login"])
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="mneme",
+                                 description="Friendly CLI for the mneme forecasting substrate")
+    ap.add_argument("--port", type=int, default=int(os.environ.get("MNEME_PORT", "4456")))
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_fc = sub.add_parser("forecast", help="fire a forecast and wait for the answer")
+    p_fc.add_argument("question", help="the binary forecast question")
+    p_fc.add_argument("--trials", type=int, default=3)
+    p_fc.add_argument("--steps", type=int, default=5,
+                      help="iterative max steps (BLF agent loop)")
+    p_fc.add_argument("--no-iterative", action="store_true",
+                      help="single-shot mode (legacy)")
+    p_fc.add_argument("--allow-tool", action="append",
+                      help="add a tool to the allowlist (repeatable)")
+    p_fc.add_argument("--id", default=None, help="custom program_id (default: timestamp)")
+    p_fc.add_argument("--timeout", type=int, default=720, help="poll deadline in seconds")
+    p_fc.set_defaults(func=cmd_forecast)
+
+    p_w = sub.add_parser("wait", help="poll a running program until done; print result")
+    p_w.add_argument("program_id")
+    p_w.add_argument("--timeout", type=int, default=720)
+    p_w.set_defaults(func=cmd_wait)
+
+    p_r = sub.add_parser("resolve", help="record a resolved outcome for a forecast")
+    p_r.add_argument("program_id")
+    p_r.add_argument("outcome", choices=["yes", "no", "y", "n", "true", "false", "1", "0"])
+    p_r.set_defaults(func=cmd_resolve)
+
+    p_s = sub.add_parser("status", help="check program status")
+    p_s.add_argument("program_id")
+    p_s.set_defaults(func=cmd_status)
+
+    p_l = sub.add_parser("last", help="show the most recent program's artifact")
+    p_l.set_defaults(func=cmd_last)
+
+    p_b = sub.add_parser("bench", help="run a ForecastBench benchmark")
+    p_b.add_argument("--n", type=int, default=20)
+    p_b.add_argument("--concurrency", type=int, default=4)
+    p_b.add_argument("--trials", type=int, default=2)
+    p_b.add_argument("--steps", type=int, default=5)
+    p_b.add_argument("--name", default="bench")
+    p_b.set_defaults(func=cmd_bench)
+
+    p_m = sub.add_parser("markets", help="live Manifold marketplace pipeline")
+    p_m.add_argument("action", choices=["watch", "resolve"])
+    p_m.add_argument("--max", type=int, default=10)
+    p_m.add_argument("--trials", type=int, default=2)
+    p_m.add_argument("--steps", type=int, default=5)
+    p_m.set_defaults(func=cmd_markets)
+
+    p_t = sub.add_parser("tickets", help="design-as-forecast ticket pipeline")
+    p_t.add_argument("action", choices=["predict", "resolve"])
+    p_t.add_argument("--plans-dir", default="../mneme/plans")
+    p_t.set_defaults(func=cmd_tickets)
+
+    p_up = sub.add_parser("up", help="start the container")
+    p_up.add_argument("-d", "--detach", action="store_true",
+                      help="run detached (default: drop into shell)")
+    p_up.set_defaults(func=cmd_up)
+
+    p_dn = sub.add_parser("down", help="stop the container")
+    p_dn.set_defaults(func=cmd_down)
+
+    sub.add_parser("logs", help="tail substrate logs").set_defaults(func=cmd_logs)
+    sub.add_parser("shell", help="docker exec into running container").set_defaults(func=cmd_shell)
+    sub.add_parser("login", help="run claude /login if no OAuth token found").set_defaults(func=cmd_login)
+
+    args = ap.parse_args()
+    sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()

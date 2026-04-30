@@ -11,86 +11,75 @@ This README is the **operator's guide** — how to run it, how to fire forecasts
 You need:
 - macOS or Linux
 - Docker Desktop / Podman / Colima (any Docker-API-compatible runtime)
-- A Claude subscription with `claude` CLI logged in (run `claude /login` once if not)
+- A Claude subscription with the `claude` CLI installed (the run script will trigger `claude /login` if you don't have an OAuth token yet)
 
 ```bash
 git clone git@github.com:hypermemetic/mneme-substrate.git
 cd mneme-substrate
 
-# Build the container. ~3 min cold; subsequent rebuilds in ~30s thanks
-# to BuildKit cache mounts on cargo registry + target dir.
-bash scripts/run_container.sh build
-
-# Start it. The script auto-discovers your Claude OAuth token in this
-# priority order:
-#   1. ANTHROPIC_API_KEY env var (if set — uses API billing)
-#   2. CLAUDE_CODE_OAUTH_TOKEN env var
-#   3. macOS Keychain entry "Claude Code-credentials" (subscription)
-# All three forward as CLAUDE_CODE_OAUTH_TOKEN to the container so
-# claude-code inside the container is authenticated.
-bash scripts/run_container.sh up -d
-
-# Watch it boot
-bash scripts/run_container.sh logs
+make install         # symlink the `mneme` CLI into ~/.local/bin
+make build           # build the container (~3 min cold; ~30s incremental thanks to BuildKit cache mounts)
+make run             # start substrate detached, drop into the container shell
 ```
 
-The substrate listens on `ws://localhost:4456` (WebSocket) and `http://localhost:4456/mcp` (MCP HTTP).
+That's it. `make run` does:
 
-If you're not on macOS:
+1. Resolves your auth token (priority: `ANTHROPIC_API_KEY` env → `CLAUDE_CODE_OAUTH_TOKEN` env → macOS Keychain entry `"Claude Code-credentials"`). If none of those have a token, it runs `claude /login` automatically.
+2. Starts the substrate in the container, bound to `ws://localhost:4456`, with `programs/` and `.plexus-state/` bind-mounted to host disk so state survives restarts.
+3. `docker exec`s you into the container with the `mneme` CLI on PATH and a friendly MOTD.
 
-```bash
-# Linux: pre-set the OAuth token from `claude /login`'s stored credentials,
-# OR use API billing:
-export ANTHROPIC_API_KEY=sk-ant-...
-bash scripts/run_container.sh up -d
-```
+`exit` returns you to your host shell. The substrate keeps running until `make down`.
 
 ## Fire your first forecast
 
-```bash
-# install synapse for ergonomic Plexus RPC calls (optional but recommended)
-# alternatively use any WebSocket client speaking JSON-RPC 2.0
+From inside the container shell (after `make run`):
 
-synapse -j -P 4456 -p '{
-  "program_id": "MY-FIRST-Q",
-  "new_evidence": "Question: Will Bitcoin trade above $200,000 on any day before 2026-12-31?\n\nForecast the probability the question resolves YES.",
-  "trials": 3,
-  "iterative_max_steps": 5,
-  "allowed_tools": ["WebSearch"]
-}' substrate forecast update
+```bash
+mneme forecast "Will Bitcoin trade above \$200,000 on any day before 2026-12-31?"
 ```
 
-You'll get back a `Started { program_id }` event immediately — `forecast.update` is fire-and-return. The work runs in background.
+That blocks until completion (~2-5 min) and prints the structured belief: probability, calibrated + raw, evidence_for, evidence_against, open_questions.
 
-After ~2-5 minutes:
+From the **host** (after `make install`, anywhere with the substrate running):
 
 ```bash
-cat programs/<program_id>/manifest.json | jq .status   # → "completed"
-cat programs/<program_id>/artifact.json | jq
+mneme forecast "Will Bitcoin trade above \$200,000 on any day before 2026-12-31?" --trials 3 --steps 5
+mneme last              # show the most recent program's belief
+mneme status <id>       # check program status
+mneme wait <id>         # block until done + print
+mneme resolve <id> no   # record outcome; calibration store grows
+```
+
+If you'd rather use synapse directly (bypassing the wrapper):
+
+```bash
+synapse -P 4456 substrate forecast update \
+  --program-id MY-Q-001 \
+  --new-evidence "Will Bitcoin trade above \$200K by 2026-12-31?" \
+  --trials 3 \
+  --iterative-max-steps 5
+
+# Returns immediately with Started { program_id }. The work is fire-and-return.
+# To see the result, either re-run `mneme wait <program_id>`, or watch `programs/<program_id>/`.
 ```
 
 The artifact has:
 - `probability` — calibrated point estimate
-- `raw_probability` — pre-Platt aggregate
-- `evidence_for` — array of `{claim, source, weight}` supporting YES
-- `evidence_against` — same shape, supporting NO
+- `raw_probability` — pre-Platt aggregate (so consumers can recalibrate against a later-fit Platt model)
+- `evidence_for` / `evidence_against` — arrays of `{claim, source, weight}`
 - `open_questions` — what would tighten the answer
-- `summary` — deterministic prose render of the structured fields
-- `n_trials` — how many parallel reasoners contributed
-- `confidence` — `multi-trial` | `single-pass` | `low` | `medium` | `high`
+- `summary` — deterministic prose render
+- `n_trials` / `confidence` / `belief_schema_version`
 
 ## Resolve it later
 
-When you know the outcome:
-
 ```bash
-synapse -P 4456 -p '{
-  "program_id": "<from above>",
-  "actual": false
-}' substrate forecast resolve
+mneme resolve <program_id> yes      # or `no`
+# equivalent synapse:
+#   synapse -P 4456 substrate forecast resolve --program-id <id> --actual true
 ```
 
-Records the `(predicted, actual)` pair. Once you have ≥10 such resolutions, Platt calibration kicks in automatically and the next forecast benefits.
+Once you have ≥10 resolved observations, Platt calibration kicks in automatically; subsequent forecasts have `probability != raw_probability` reflecting the bias correction.
 
 ## Run the benchmark
 
@@ -103,11 +92,7 @@ curl -L -o programs/_benchmarks/forecastbench/2024-07-21_resolution_set.json \
   https://raw.githubusercontent.com/forecastingresearch/forecastbench-datasets/main/datasets/resolution_sets/2024-07-21_resolution_set.json
 
 # n=20 paired vs the prediction-market crowd, ~10 min wall-clock at concurrency=4
-python3 scripts/forecastbench_live_run.py \
-  --question-set programs/_benchmarks/forecastbench/2024-07-21-llm.json \
-  --resolution-set programs/_benchmarks/forecastbench/2024-07-21_resolution_set.json \
-  --n 20 --concurrency 4 --port 4456 --trials 2 --iterative-max-steps 5 \
-  --output programs/_benchmarks/runs/$(date +%Y%m%d-%H%M%S)-mybench/
+mneme bench --n 20 --name mybench
 ```
 
 Reports independent + paired Brier Index for both mneme and the crowd, with bootstrap 95% CIs. Per-source breakdowns. The default in v0.1 will land you somewhere near our bench-005 result (BI ~84 vs crowd ~70 on this contaminated 2024 sample).
@@ -119,11 +104,8 @@ For honest post-cutoff held-out evaluation see `scripts/forecastbench_holdout_ru
 The live marketplace pipeline runs the substrate continuously against open prediction markets. No web-search contamination is possible — the answers don't exist yet.
 
 ```bash
-# Pick 10 open binary markets, fire forecasts, log paired (manifold_p, our_p)
-python3 scripts/marketwatch_live.py --max-markets 10 --port 4456
-
-# Resolution sweeper — finds resolved markets, feeds calibration store
-python3 scripts/marketwatch_resolve.py --port 4456
+mneme markets watch         # pick ~10 open binary markets, log paired (manifold_p, our_p)
+mneme markets resolve       # sweep resolved markets, feed calibration store
 ```
 
 Designed for cron — see `scripts/marketwatch_README.md`. Pairings accumulate in `programs/_marketwatch/pairings.jsonl`; the dataset that grows over weeks/months is what eventually produces defensible product claims.
@@ -146,14 +128,11 @@ forecast:
 Then:
 
 ```bash
-python3 scripts/ticket_forecast.py --plans-dir ../mneme/plans
-# → fires forecast.update for the ticket; records prediction in plans/_predictions.jsonl
-
-python3 scripts/ticket_resolve.py --plans-dir ../mneme/plans
-# → CLI prompt for actual outcome; calls forecast.resolve; calibration grows
+mneme tickets predict       # fires forecast.update for each ticket with a forecast: block
+mneme tickets resolve       # CLI prompt for actual outcome; calls forecast.resolve
 ```
 
-The substrate's same forecasting machinery applied to the substrate's own design choices. Over time, the calibration store accumulates rows specifically about the system's design intuitions — meta-evidence about whether to trust the system on design questions.
+The substrate's same forecasting machinery applied to its own design choices. Over time, the calibration store accumulates rows specifically about the system's design intuitions — meta-evidence about whether to trust the system on design questions.
 
 ## Activations
 

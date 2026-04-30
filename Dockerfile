@@ -87,10 +87,43 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Substrate binary (copied out of the cache mount during the build RUN above)
 COPY --from=builder /build/mneme-substrate-bin /usr/local/bin/mneme-substrate
 
+# Helper scripts available inside the container. The `mneme` CLI is the
+# friendly entry point; the others are the bench / market / ticket
+# pipelines. Users can run `mneme forecast "..."` directly from the
+# in-container shell.
+COPY mneme-substrate/scripts/ /workspace/scripts/
+RUN chmod +x /workspace/scripts/* \
+    && ln -s /workspace/scripts/mneme /usr/local/bin/mneme
+
 # Where the substrate writes its per-program state. Mount a host dir or
 # named volume here for persistence.
 WORKDIR /workspace
 RUN mkdir -p /workspace/programs
+
+# A friendly bash prompt + helpful welcome banner for the in-container
+# shell. Shown when the user `docker exec`s in (e.g. via `mneme up`).
+RUN echo 'export PS1="\[\033[1;36m\]mneme\[\033[0m\] \[\033[1;32m\]\W\[\033[0m\] $ "' >> /root/.bashrc \
+    && echo 'cat /etc/motd 2>/dev/null || true' >> /root/.bashrc
+
+RUN cat > /etc/motd <<'EOF'
+
+╭──────────────────────────────────────────────────────────────╮
+│  mneme — forecasting substrate (BLF, Murphy 2026)            │
+│                                                              │
+│  Substrate is running on ws://localhost:4456 inside this     │
+│  container. From this shell:                                 │
+│                                                              │
+│    mneme forecast "Will X happen by Y?"   ← block + print    │
+│    mneme last                              ← last result      │
+│    mneme bench --n 20                      ← run benchmark    │
+│    mneme markets watch                     ← live Manifold    │
+│    mneme tickets predict                   ← design forecasts │
+│                                                              │
+│  exit returns to your host shell. Substrate keeps running    │
+│  until you `mneme down` (or scripts/run_container.sh stop).  │
+╰──────────────────────────────────────────────────────────────╯
+
+EOF
 
 # Substrate listens on this port; map to host with -p 4456:4456.
 EXPOSE 4456

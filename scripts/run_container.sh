@@ -15,8 +15,8 @@
 #
 # Usage:
 #   ./scripts/run_container.sh build       # build the image
-#   ./scripts/run_container.sh up          # run it (foreground)
-#   ./scripts/run_container.sh up -d       # run detached
+#   ./scripts/run_container.sh up          # start substrate detached, drop into shell
+#   ./scripts/run_container.sh up -d       # start detached, no shell
 #   ./scripts/run_container.sh stop        # kill the running container
 #   ./scripts/run_container.sh logs        # tail logs
 #   ./scripts/run_container.sh shell       # exec a shell into the running container
@@ -67,7 +67,32 @@ case "$cmd" in
       fi
     fi
     if [[ ${#auth_args[@]} -eq 0 ]]; then
-      echo "WARNING: no auth source found (set ANTHROPIC_API_KEY or login via 'claude /login' on the host)" >&2
+      echo "no Claude OAuth token found." >&2
+      if command -v claude >/dev/null 2>&1; then
+        echo "running 'claude /login' to fetch one — accept the OAuth flow in your browser..." >&2
+        claude /login || {
+          echo "ERROR: 'claude /login' failed; aborting" >&2
+          exit 1
+        }
+        # retry the keychain after login
+        kc_blob=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)
+        if [[ -n "$kc_blob" ]]; then
+          token=$(printf '%s' "$kc_blob" | python3 -c 'import json,sys; print(json.load(sys.stdin)["claudeAiOauth"]["accessToken"])' 2>/dev/null || true)
+          if [[ -n "$token" ]]; then
+            echo "auth: macOS Keychain (post-login, ${token:0:20}...)"
+            auth_args=(-e "CLAUDE_CODE_OAUTH_TOKEN=$token")
+          fi
+        fi
+      else
+        echo "ERROR: no auth source AND 'claude' CLI not installed." >&2
+        echo "  Install Claude Code from https://docs.claude.com/en/docs/claude-code/quickstart" >&2
+        echo "  OR set ANTHROPIC_API_KEY before running this script." >&2
+        exit 1
+      fi
+    fi
+    if [[ ${#auth_args[@]} -eq 0 ]]; then
+      echo "ERROR: still no auth after login attempt" >&2
+      exit 1
     fi
     # Single unified bind mount of host programs/ → container /workspace/programs/.
     # This gives both sides the same view: vendored bench data is visible
@@ -85,13 +110,43 @@ case "$cmd" in
     mkdir -p "$(pwd)/.plexus-state"
     echo "plexus state: bind-mounting $(pwd)/.plexus-state to /root/.plexus"
 
-    docker run "$@" \
+    # Default `up` (no flags): start substrate detached, then exec into
+    # an interactive shell with the substrate already running. The user
+    # gets a prompt where `synapse`, `mneme`, etc. work immediately.
+    # `up -d` skips the interactive shell (substrate stays detached).
+    detach_flag="-d"
+    interactive_after=true
+    for a in "$@"; do
+      if [[ "$a" == "-d" || "$a" == "--detach" ]]; then
+        interactive_after=false
+      fi
+    done
+    docker run -d \
       --name "$CONTAINER_NAME" \
       -p "$HOST_PORT:4456" \
       -v "$(pwd)/programs:/workspace/programs" \
       -v "$(pwd)/.plexus-state:/root/.plexus" \
+      -v "$(pwd):/workspace/host:ro" \
       "${auth_args[@]}" \
-      "$IMAGE_NAME"
+      "$IMAGE_NAME" >/dev/null
+    # wait briefly for substrate readiness
+    for _ in $(seq 1 20); do
+      if docker logs "$CONTAINER_NAME" 2>&1 | grep -q "Substrate Plexus RPC server started"; then
+        break
+      fi
+      sleep 0.5
+    done
+    echo
+    echo "✓ substrate up at ws://localhost:$HOST_PORT (container: $CONTAINER_NAME)"
+    echo "  inside the container, try:  mneme forecast \"Will X happen by date Y?\""
+    echo "  on the host:                 mneme last  |  mneme down"
+    if $interactive_after; then
+      echo
+      echo "dropping you into the container shell. exit returns to your host;"
+      echo "the substrate keeps running until 'mneme down' or 'scripts/run_container.sh stop'."
+      echo
+      docker exec -it "$CONTAINER_NAME" bash
+    fi
     ;;
   stop)
     docker rm -f "$CONTAINER_NAME"

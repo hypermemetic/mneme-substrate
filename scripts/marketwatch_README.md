@@ -48,6 +48,64 @@ python3 scripts/marketwatch_live.py \
   --concurrency 6
 ```
 
+## Up/down lifecycle (resilience, MNEME-33)
+
+The pipeline is designed to survive periodic substrate downtime — the
+laptop closing, container restart, host migration. Three guarantees:
+
+**1. Orphan-forecast recovery.** If `marketwatch_live.py` is killed
+between `forecast.update` returning and the pairing row being
+written, the next invocation scans `programs/` for any
+`MANIFOLD-LIVE-*` programs that have completed but aren't in
+`pairings.jsonl`. It reconstructs the pairing row from the artifact
+and appends it with `ts_recovered: true`. Idempotent.
+
+**2. Two-phase resolution.** `marketwatch_resolve.py` is split:
+
+- **Phase A** — network-only. Hits Manifold for each unresolved
+  market, writes any new resolution to `resolutions.jsonl` with
+  `fed_calibration: pending`. Does **not** require the substrate.
+- **Phase B** — substrate-only. Reads `resolutions.jsonl`, finds rows
+  with `fed_calibration in {pending, failed}`, and calls
+  `forecast.resolve` for each forecast we made on that market.
+  Records each attempt in `_calibration_feeds.jsonl`. Idempotent —
+  re-running retries failures without re-feeding successes.
+
+```bash
+python3 scripts/marketwatch_resolve.py                      # both phases
+python3 scripts/marketwatch_resolve.py --phase a-only       # substrate down
+python3 scripts/marketwatch_resolve.py --phase b-only       # retry feeds
+```
+
+If you run with the substrate down, use `--phase a-only`. When the
+substrate comes back up, run `--phase b-only` (or default `both`) to
+flush pending feeds.
+
+**3. Manifold market deletion.** A 404 / 410 / empty body from
+Manifold's market endpoint is logged as "gone from manifold" and the
+sweep continues. The pairing remains in `pairings.jsonl`; the next
+sweep will retry. (If a market is permanently gone, manually purge
+its pairing row.)
+
+**4. Substrate liveness check.** Both scripts probe `synapse -P <port>
+substrate _info` at startup and exit with a clear error if the
+substrate isn't reachable. (`marketwatch_resolve.py --phase a-only`
+skips this check.)
+
+## Integration test
+
+`scripts/test_marketwatch_resilience.sh` exercises the resilience
+behaviors end-to-end against a running substrate:
+
+```bash
+./scripts/test_marketwatch_resilience.sh
+```
+
+It seeds a synthetic orphan, verifies recovery, verifies idempotence,
+verifies 404 handling on a nonexistent market, and verifies that
+`--phase a-only` doesn't require the substrate while `--phase b-only`
+refuses to run without it. Exits non-zero on any failed assertion.
+
 ## Suggested cron schedule
 
 ```cron
@@ -68,7 +126,8 @@ scripts to work.
 | file | what |
 |---|---|
 | `pairings.jsonl` | append-only log of every forecast we made + the manifold crowd price at that moment |
-| `resolutions.jsonl` | append-only log of markets that have resolved + which of our forecasts were fed to the calibration store |
+| `resolutions.jsonl` | append-only log of markets that have resolved (Phase A writes one row per resolved market) |
+| `_calibration_feeds.jsonl` | append-only log of every `forecast.resolve` attempt (Phase B). Most recent `(market_id, program_id)` row wins on retry. |
 | `selected.json` | last invocation's market selection (for diagnostic / debug) |
 
 A row in pairings.jsonl looks like:

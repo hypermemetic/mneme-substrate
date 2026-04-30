@@ -95,6 +95,106 @@ def select_markets(markets, *, close_min_days, close_max_days, min_volume, max_m
     return filtered[:max_markets]
 
 
+def check_substrate_alive(port: int) -> bool:
+    """Quick liveness probe before doing any work. `substrate hash` is
+    a no-op call that returns the substrate's config hash."""
+    try:
+        out = subprocess.run(
+            ["synapse", "-P", str(port), "substrate", "hash"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.returncode == 0
+    except Exception:
+        return False
+
+
+def recover_orphan_forecasts(programs_root: Path = Path("programs")):
+    """Scan programs/ for MANIFOLD-LIVE programs that aren't in pairings.jsonl;
+    reconstruct pairing rows from their artifacts. Idempotent.
+
+    The substrate's `forecast.update` opens a new program (with a fresh
+    UUID) for each call. The user-supplied `program_id` parameter
+    (`MANIFOLD-LIVE-<market_id>`) is recorded as inputs.question_program_id.
+    A pairing is "orphan" if the substrate completed its program but
+    marketwatch_live.py crashed before appending the pairing row.
+    """
+    prior = load_pairings()
+    known_program_ids = {p.get("program_id") for p in prior if p.get("program_id")}
+    if not programs_root.exists():
+        return 0
+
+    recovered = 0
+    for child in programs_root.iterdir():
+        if not child.is_dir() or child.name.startswith("_"):
+            continue
+        manifest_path = child / "manifest.json"
+        if not manifest_path.exists():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except Exception:
+            continue
+        question_pid = manifest.get("inputs", {}).get("question_program_id", "")
+        if not question_pid.startswith("MANIFOLD-LIVE-"):
+            continue
+        program_id = manifest.get("program_id") or child.name
+        if program_id in known_program_ids:
+            continue
+        # Orphan candidate. Build a pairing row.
+        market_id = question_pid[len("MANIFOLD-LIVE-"):]
+        artifact_path = child / "artifact.json"
+        error_path = child / "error.json"
+        new_evidence = manifest.get("inputs", {}).get("new_evidence", "")
+        # Best-effort question reconstruction from new_evidence:
+        question_line = ""
+        for line in new_evidence.splitlines():
+            if line.startswith("Question:"):
+                question_line = line[len("Question:"):].strip()
+                break
+        # Pull manifold_p from new_evidence (was: "Current crowd probability (manifold): 0.4500")
+        manifold_p = None
+        for line in new_evidence.splitlines():
+            if "Current crowd probability (manifold):" in line:
+                try:
+                    manifold_p = float(line.split(":", 1)[1].strip())
+                except Exception:
+                    pass
+
+        now = datetime.now(timezone.utc)
+        row = {
+            "ts": now.isoformat(),
+            "ts_unix": int(now.timestamp()),
+            "ts_recovered": True,
+            "market_id": market_id,
+            "question": question_line,
+            "manifold_p": manifold_p,
+            "program_id": program_id,
+        }
+        if artifact_path.exists():
+            try:
+                a = json.loads(artifact_path.read_text())
+                row.update(
+                    our_p=a.get("probability"),
+                    our_raw_p=a.get("raw_probability"),
+                    n_trials=a.get("n_trials"),
+                    summary=a.get("summary", "")[:500],
+                )
+            except Exception as e:
+                row["error"] = f"orphan artifact parse: {e}"
+        elif error_path.exists():
+            row["error"] = f"orphan program failed: {error_path.read_text()[:200]}"
+        else:
+            row["error"] = "orphan program incomplete (no artifact, no error)"
+
+        MARKETWATCH_DIR.mkdir(parents=True, exist_ok=True)
+        with PAIRINGS_PATH.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+        recovered += 1
+        print(f"  [orphan {program_id[:8]}] recovered for market {market_id[:8]}: "
+              f"{'success' if 'our_p' in row else 'failure'}", flush=True)
+    return recovered
+
+
 def load_pairings():
     if not PAIRINGS_PATH.exists():
         return []
@@ -234,6 +334,18 @@ def main():
                     help="re-forecast if last forecast is older than this")
     ap.add_argument("--max-pages", type=int, default=10)
     args = ap.parse_args()
+
+    if not check_substrate_alive(args.port):
+        print(
+            f"ERROR: substrate at port {args.port} not reachable. "
+            f"Start it with `make run` from mneme-substrate/.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    recovered = recover_orphan_forecasts()
+    if recovered:
+        print(f"recovered {recovered} orphan forecast(s) before starting", flush=True)
 
     print(f"fetching open binary markets from manifold (max {args.max_pages} pages)...", flush=True)
     candidates = fetch_open_binary_markets(max_pages=args.max_pages)
